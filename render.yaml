@@ -23,3 +23,9 @@ services:
         sync: false
       - key: AUTH_SECRET
         generateValue: true
+      - key: WEBHOOK_SIGNING_SECRET
+        generateValue: true
+      - key: ASR_PROVIDER
+        value: "sarvam"
+      - key: ASR_API_KEY
+        sync: false

@@ -16,12 +16,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
-from app.asr import ServerASRAdapter
-from app.db import Base, create_db_engine, get_database_url, get_storage_backend
+from app.asr import ServerASRAdapter, ServerASRResult
+from app.auth import validate_live_secrets
+from app.db import Base, CURRENT_SCHEMA_VERSION, create_db_engine, get_database_url, get_storage_backend, init_db, is_storage_durable
 from app.detectif_client import DetectifClient
-from app.main import app, get_db, get_detectif_client
-from app.models import AuditEvent, Enrollment, VerificationSession, utcnow
-from app.policy import verify_risk_event_signature
+from app.main import _is_ist_after_hours, app, get_asr_adapter, get_db, get_detectif_client
+from app.models import AuditEvent, Enrollment, SchemaVersion, VerificationSession, utcnow
+from app.policy import normalize_transcript, verify_phrase_match, verify_risk_event_signature
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 ENROLL_FIXTURE = json.loads((FIXTURES_DIR / "eidos_enroll.json").read_text(encoding="utf-8"))
@@ -62,7 +63,7 @@ def make_pcm_wav_bytes(
 def db_session_factory(tmp_path):
     db_file = tmp_path / "test_voicesuraksha.db"
     engine = create_db_engine(f"sqlite:///{db_file}")
-    Base.metadata.create_all(bind=engine)
+    init_db(engine)
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     try:
         yield TestingSessionLocal
@@ -80,8 +81,28 @@ def make_mock_client(handler) -> DetectifClient:
 
 
 @pytest.fixture()
-def make_test_client(db_session_factory):
-    def _factory(mock_handler, *, auto_login_admin: bool = True):
+def make_test_client(db_session_factory, monkeypatch):
+    def _factory(mock_handler, *, auto_login_admin: bool = True, demo_mode: bool = False):
+        monkeypatch.setenv("DEMO_MODE", "true" if demo_mode else "false")
+        monkeypatch.setenv("AUTH_SECRET", "pytest-live-auth-secret-32-chars-ok")
+        monkeypatch.setenv("WEBHOOK_SIGNING_SECRET", "pytest-live-webhook-secret-32-chars")
+        monkeypatch.setenv("ADMIN_PASSWORD", "pytest-strong-admin-password-2026")
+        monkeypatch.setenv("ASR_API_KEY", "pytest-hosted-asr-key")
+        monkeypatch.setattr("app.main._is_ist_after_hours", lambda _now=None: False)
+
+        asr_cfg: dict = {"available": True, "transcript": None}
+
+        class _TestASRAdapter(ServerASRAdapter):
+            def transcribe_wav(self, wav_bytes: bytes) -> ServerASRResult:
+                if not asr_cfg["available"]:
+                    return ServerASRResult(available=False, transcript=None, provider="sarvam", error="asr_unavailable")
+                if asr_cfg["transcript"] is not None:
+                    return ServerASRResult(available=True, transcript=asr_cfg["transcript"], provider="sarvam")
+                with db_session_factory() as db:
+                    latest = db.query(VerificationSession).order_by(VerificationSession.expires_at.desc()).first()
+                    txt = latest.challenge_text if latest else ""
+                return ServerASRResult(available=True, transcript=txt, provider="sarvam")
+
         def _override_get_db():
             db = db_session_factory()
             try:
@@ -91,7 +112,9 @@ def make_test_client(db_session_factory):
 
         app.dependency_overrides[get_db] = _override_get_db
         app.dependency_overrides[get_detectif_client] = lambda: make_mock_client(mock_handler)
+        app.dependency_overrides[get_asr_adapter] = lambda: _TestASRAdapter()
         client = TestClient(app)
+        client._asr_cfg = asr_cfg  # type: ignore[attr-defined]
         if auto_login_admin:
             from app.auth import get_admin_credentials
 
@@ -232,6 +255,7 @@ def test_wrong_phrase_and_session_replay(make_test_client):
         },
     ).json()
 
+    client._asr_cfg["transcript"] = "some completely wrong replayed phrase"
     resp = client.post(
         f"/api/v1/verification-sessions/{sess['session_id']}/audio",
         data={"spoken_transcript": "some completely wrong replayed phrase", "strict_phrase": "true"},
@@ -512,6 +536,12 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
     client = make_test_client(handler)
     _enroll_subject(client, "SUB-501")
 
+    # Set privileged_role server-side via admin endpoint (caller field is ignored)
+    assert (
+        client.patch("/api/v1/admin/subjects/SUB-501/privilege", json={"privileged_role": True}).status_code
+        == 200
+    )
+
     # Privileged helpdesk MFA reset -> STEP-UP even on voice match
     priv_sess = client.post(
         "/api/v1/verification-sessions",
@@ -520,7 +550,6 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
             "subject_ref": "SUB-501",
             "action": "mfa_reset",
             "resource_ref": "MFA-ADMIN-01",
-            "privileged_role": True,
         },
     ).json()
     priv_res = client.post(
@@ -587,11 +616,13 @@ def test_clear_demo_alerts_keeps_enrollments_intact(make_test_client):
             "resource_ref": "SIM-MASKED-6010",
         },
     ).json()
+    client._asr_cfg["transcript"] = "wrong phrase"
     tel_res = client.post(
         f"/api/v1/verification-sessions/{tel_sess['session_id']}/audio",
         data={"spoken_transcript": "wrong phrase", "strict_phrase": "true"},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
+    client._asr_cfg["transcript"] = None
     assert tel_res["emitted_risk_event"]["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED"
     assert len(client.get("/api/v1/risk-events").json()["risk_events"]) == 1
 
@@ -623,12 +654,14 @@ def test_clear_demo_alerts_keeps_enrollments_intact(make_test_client):
     assert bank_res["decision_token"] is not None
 
 
-def test_voice_first_mode_passes_without_exact_transcript(make_test_client):
+def test_critical_actions_enforce_server_asr_while_low_friction_allows_voice_first(make_test_client):
     handler, captured_headers = _default_fixture_handler()
     client = make_test_client(handler)
     _enroll_subject(client, "SUB-701")
 
-    sess = client.post(
+    # Critical action (sim_replacement) rejects when server ASR hears a non-matching phrase,
+    # even if client lies in spoken_transcript
+    crit_sess = client.post(
         "/api/v1/verification-sessions",
         json={
             "sector": "telecom",
@@ -637,12 +670,30 @@ def test_voice_first_mode_passes_without_exact_transcript(make_test_client):
             "resource_ref": "SIM-MASKED-7010",
         },
     ).json()
-    assert sess["challenge_text"].startswith("Confirm sim replacement code ")
+    assert crit_sess["challenge_text"].startswith("Confirm sim replacement code ")
+    client._asr_cfg["transcript"] = "hi my name is attacker replaying wrong text"
+    crit_res = client.post(
+        f"/api/v1/verification-sessions/{crit_sess['session_id']}/audio",
+        data={"spoken_transcript": crit_sess["challenge_text"], "strict_phrase": "false"},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert crit_res["outcome"] == "REJECTED"
+    assert crit_res["reason_codes"] == ["CHALLENGE_MISMATCH"]
 
-    # Even with different/empty spoken_transcript, voice-first mode runs Eidos + Aletheia and approves on voice match
+    # Non-critical protective action (emergency_sim_block, critical=False) works voice-first
+    low_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-701",
+            "action": "emergency_sim_block",
+            "resource_ref": "SIM-MASKED-7011",
+        },
+    ).json()
+    client._asr_cfg["transcript"] = "please block my lost phone immediately"
     res = client.post(
-        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
-        data={"spoken_transcript": "hi my name is govind testing our hackathon project"},
+        f"/api/v1/verification-sessions/{low_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     )
     assert res.status_code == 200
@@ -1039,7 +1090,7 @@ def test_audio_replay_detected_even_when_transcript_matches(make_test_client):
     assert res2["reason_codes"] == ["AUDIO_REPLAY_DETECTED"]
     assert res2["decision_token"] is None
     assert len(captured_headers) == 2  # DetectifAI was NOT called again
-    assert ServerASRAdapter(enabled=False).transcribe_wav(reused_wav).enabled is False
+    assert ServerASRAdapter(provider="disabled", api_key="").transcribe_wav(reused_wav).available is False
 
 
 def test_hmac_signature_verification_on_sim_swap_alert(make_test_client, monkeypatch):
@@ -1166,3 +1217,192 @@ def test_silent_and_clipped_audio_quality_low_skips_detectif_provider(make_test_
     assert clip_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
     assert clip_res["audio_quality"]["clipping_ratio"] > 0.15
     assert len(captured_headers) == 1
+
+
+def test_hosted_asr_adapter_providers_and_fail_closed(make_pcm_fixture=None):
+    wav = make_pcm_wav_bytes(5.0)
+
+    # Missing key fails closed
+    disabled = ServerASRAdapter(provider="sarvam", api_key="")
+    res_dis = disabled.transcribe_wav(wav)
+    assert res_dis.available is False
+    assert res_dis.error == "asr_not_configured"
+
+    # Sarvam REST contract
+    sarvam_transport = httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"transcript": "Confirm sim replacement code blew river forty two"})
+        if req.headers.get("api-subscription-key") == "srv-key"
+        else httpx.Response(401)
+    )
+    sarvam = ServerASRAdapter(provider="sarvam", api_key="srv-key", transport=sarvam_transport)
+    res_srv = sarvam.transcribe_wav(wav)
+    assert res_srv.available is True
+    assert res_srv.transcript == "Confirm sim replacement code blew river forty two"
+
+    # Deepgram REST contract
+    dg_transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={"results": {"channels": [{"alternatives": [{"transcript": "confirm mfa reset code"}]}]}},
+        )
+    )
+    dg = ServerASRAdapter(provider="deepgram", api_key="dg-key", transport=dg_transport)
+    assert dg.transcribe_wav(wav).transcript == "confirm mfa reset code"
+
+    # Upstream timeout fails closed
+    def _timeout(_req):
+        raise httpx.ReadTimeout("ASR timeout")
+
+    timed_out = ServerASRAdapter(provider="sarvam", api_key="srv-key", transport=httpx.MockTransport(_timeout))
+    assert timed_out.transcribe_wav(wav).available is False
+
+
+def test_normalize_transcript_tolerance_keeps_exact_code_tokens():
+    challenge = "Confirm sim replacement code blue river 42."
+    assert verify_phrase_match(challenge, "Confirm sim replacement code blew river four to") is True
+    assert verify_phrase_match(challenge, "confirm sim replacement code blue river forty two") is True
+    assert verify_phrase_match(challenge, "confirm sim replacement code green river 42") is False
+    assert verify_phrase_match(challenge, "confirm sim replacement code blue river 43") is False
+    assert normalize_transcript("Confirm esim transfer code lite tiger 09") == "confirm esim transfer code light tiger 0 9"
+
+
+def test_live_asr_unavailable_holds_while_client_transcript_ignored(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, demo_mode=False)
+    _enroll_subject(client, "SUB-ASR-1")
+
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-ASR-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-ASR-1",
+        },
+    ).json()
+
+    # In LIVE mode with ASR unavailable, critical action MUST hold (ASR_UNAVAILABLE) even if client sends phrase
+    client._asr_cfg["available"] = False
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": sess["challenge_text"]},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert res["outcome"] == "REVIEW / HOLD"
+    assert res["status"] == "HOLD"
+    assert res["reason_codes"] == ["ASR_UNAVAILABLE"]
+    assert res["decision_token"] is None
+
+
+def test_server_context_ignores_tampered_after_hours_privileged_and_amount(make_test_client, monkeypatch):
+    from datetime import datetime, timezone
+
+    # Verify IST after-hours helper directly (23:30 IST -> True, 14:00 Wed IST -> False, Sat 14:00 IST -> True)
+    assert _is_ist_after_hours(datetime(2026, 11, 25, 18, 0, tzinfo=timezone.utc)) is True  # 23:30 IST
+    assert _is_ist_after_hours(datetime(2026, 11, 25, 8, 30, tzinfo=timezone.utc)) is False  # 14:00 Wed IST
+    assert _is_ist_after_hours(datetime(2026, 11, 28, 8, 30, tzinfo=timezone.utc)) is True  # 14:00 Sat IST
+
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "context.user",
+            "display_name": "Context User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "CTX-1",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reg.status_code == 200
+    sub = reg.json()["user"]["subject_ref"]
+
+    # Non-admin cannot set privileged_role via admin endpoint
+    assert client.patch(f"/api/v1/admin/subjects/{sub}/privilege", json={"privileged_role": True}).status_code == 403
+
+    # Caller sends after_hours=False while server clock is IST 23:30 -> server enforces AFTER_HOURS_COOLING_HOLD
+    monkeypatch.setattr("app.main._is_ist_after_hours", lambda _now=None: True)
+    tel_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": sub,
+            "action": "sim_replacement",
+            "resource_ref": "SIM-CTX-1",
+            "after_hours": False,
+        },
+    ).json()
+    tel_res = client.post(
+        f"/api/v1/verification-sessions/{tel_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert tel_res["outcome"] == "STEP-UP"
+    assert "AFTER_HOURS_COOLING_HOLD" in tel_res["reason_codes"]
+
+    # Caller claims privileged_role=True on non-privileged account -> ignored (helpdesk approves)
+    monkeypatch.setattr("app.main._is_ist_after_hours", lambda _now=None: False)
+    hd_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "helpdesk",
+            "subject_ref": sub,
+            "action": "mfa_reset",
+            "resource_ref": "TKT-CTX-1",
+            "privileged_role": True,
+        },
+    ).json()
+    hd_res = client.post(
+        f"/api/v1/verification-sessions/{hd_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert hd_res["outcome"] == "APPROVED"
+
+    # Normal user sending amount_inr on banking card_replacement -> ignored -> STEP-UP AMOUNT_REQUIRED
+    bk_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "banking",
+            "subject_ref": sub,
+            "action": "card_replacement",
+            "resource_ref": "CARD-CTX-1",
+            "amount_inr": 1000,
+        },
+    ).json()
+    bk_res = client.post(
+        f"/api/v1/verification-sessions/{bk_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v3.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert bk_res["outcome"] == "STEP-UP"
+    assert "AMOUNT_REQUIRED" in bk_res["reason_codes"]
+
+
+def test_live_mode_refuses_startup_on_default_or_short_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEMO_MODE", "false")
+    monkeypatch.setenv("AUTH_SECRET", "strong-auth-secret-over-16-chars")
+    monkeypatch.setenv("WEBHOOK_SIGNING_SECRET", "strong-webhook-secret-over-16")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin123")
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        validate_live_secrets()
+
+    monkeypatch.setenv("ADMIN_PASSWORD", "strong-admin-password-over-16")
+    monkeypatch.setenv("AUTH_SECRET", "short")
+    with pytest.raises(RuntimeError, match="AUTH_SECRET"):
+        validate_live_secrets()
+
+    monkeypatch.setenv("DEMO_MODE", "true")
+    validate_live_secrets()  # Permitted in DEMO_MODE
+
+    # Verify schema_version migration tracking works cleanly on SQLite
+    db_file = tmp_path / "migrated.db"
+    eng = create_db_engine(f"sqlite:///{db_file}")
+    init_db(eng)
+    with sessionmaker(bind=eng)() as db:
+        row = db.query(SchemaVersion).filter_by(version=CURRENT_SCHEMA_VERSION).one()
+        assert row.version == CURRENT_SCHEMA_VERSION
+    assert is_storage_durable(f"sqlite:///{db_file}") is False
+    eng.dispose()

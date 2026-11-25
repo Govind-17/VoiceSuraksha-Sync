@@ -11,7 +11,9 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-DEFAULT_DEV_WEBHOOK_SECRET = "voicesuraksha-dev-webhook-secret"
+from app.auth import is_demo_mode, is_weak_secret
+
+_EPHEMERAL_DEMO_WEBHOOK_SECRET = secrets.token_urlsafe(32)
 
 GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
     "telecom": {
@@ -68,15 +70,53 @@ _CHALLENGE_WORDS = [
 
 _DIGIT_WORDS = {
     "zero": "0",
+    "oh": "0",
     "one": "1",
+    "won": "1",
     "two": "2",
+    "to": "2",
+    "too": "2",
     "three": "3",
+    "tree": "3",
     "four": "4",
+    "for": "4",
+    "fore": "4",
     "five": "5",
     "six": "6",
     "seven": "7",
     "eight": "8",
+    "ate": "8",
     "nine": "9",
+    "niner": "9",
+}
+
+_TENS_WORDS = {
+    "twenty": "2",
+    "thirty": "3",
+    "forty": "4",
+    "fifty": "5",
+    "sixty": "6",
+    "seventy": "7",
+    "eighty": "8",
+    "ninety": "9",
+}
+
+_TEEN_WORDS = {
+    "ten": ("1", "0"),
+    "eleven": ("1", "1"),
+    "twelve": ("1", "2"),
+    "thirteen": ("1", "3"),
+    "fourteen": ("1", "4"),
+    "fifteen": ("1", "5"),
+    "sixteen": ("1", "6"),
+    "seventeen": ("1", "7"),
+    "eighteen": ("1", "8"),
+    "nineteen": ("1", "9"),
+}
+
+_HOMOPHONE_MAP = {
+    "blew": "blue",
+    "lite": "light",
 }
 
 
@@ -102,6 +142,7 @@ class SessionPolicyInput:
     amount_inr: float | None = None
     expired: bool = False
     require_phrase_match: bool = False
+    asr_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -136,10 +177,34 @@ def generate_challenge_phrase(sector: str, action: str, resource_ref: str) -> st
 
 
 def normalize_transcript(text: str) -> str:
-    """Normalize SpeechRecognition transcript and challenge text for server-side comparison."""
+    """Normalize ASR/transcript text with bounded digit-word and homophone tolerance while keeping exact token order."""
     cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
-    tokens = [_DIGIT_WORDS.get(tok, tok) for tok in cleaned.split()]
-    return " ".join(tokens)
+    cleaned = re.sub(r"\be\s+sim\b", "esim", cleaned)
+    cleaned = re.sub(r"\bwi\s+fi\b", "wifi", cleaned)
+
+    raw_tokens = cleaned.split()
+    out: list[str] = []
+    idx = 0
+    while idx < len(raw_tokens):
+        tok = _HOMOPHONE_MAP.get(raw_tokens[idx], raw_tokens[idx])
+        if tok in _TEEN_WORDS:
+            out.extend(_TEEN_WORDS[tok])
+        elif tok in _TENS_WORDS:
+            out.append(_TENS_WORDS[tok])
+            # Only look ahead for unit digit (e.g. "forty two" -> "4", "2"; "forty" alone -> "4", "0")
+            if idx + 1 < len(raw_tokens) and _DIGIT_WORDS.get(raw_tokens[idx + 1], raw_tokens[idx + 1]) in set("123456789"):
+                out.append(_DIGIT_WORDS.get(raw_tokens[idx + 1], raw_tokens[idx + 1]))
+                idx += 1
+            else:
+                out.append("0")
+        elif tok in _DIGIT_WORDS:
+            out.append(_DIGIT_WORDS[tok])
+        elif tok.isdigit():
+            out.extend(list(tok))
+        else:
+            out.append(tok)
+        idx += 1
+    return " ".join(out)
 
 
 def hash_text_sha256(value: str) -> str:
@@ -148,8 +213,15 @@ def hash_text_sha256(value: str) -> str:
 
 
 def get_webhook_signing_secret() -> str:
-    """Load WEBHOOK_SIGNING_SECRET from environment with a safe development fallback."""
-    return os.getenv("WEBHOOK_SIGNING_SECRET", "").strip() or DEFAULT_DEV_WEBHOOK_SECRET
+    """Load WEBHOOK_SIGNING_SECRET from env; refuse missing/default secrets in LIVE mode."""
+    secret = os.getenv("WEBHOOK_SIGNING_SECRET", "").strip()
+    if is_weak_secret(secret):
+        if is_demo_mode():
+            return _EPHEMERAL_DEMO_WEBHOOK_SECRET
+        raise RuntimeError(
+            "WEBHOOK_SIGNING_SECRET is missing or insecure (<16 chars / known default) in LIVE mode."
+        )
+    return secret
 
 
 def sign_risk_event_payload(payload: dict[str, Any], secret: str | None = None) -> str:
@@ -210,7 +282,7 @@ def evaluate_voice_authorization(
             emit_risk_alert=False,
         )
 
-    if session.require_phrase_match and not phrase_match:
+    if session.require_phrase_match and session.asr_available and not phrase_match:
         return AuthorizationDecision(
             outcome="REJECTED",
             evidence_state="CHALLENGE_FAILED",
@@ -286,6 +358,18 @@ def evaluate_voice_authorization(
             emit_risk_alert=(session.sector == "telecom" and critical_action),
         )
 
+    if session.require_phrase_match and not session.asr_available:
+        return AuthorizationDecision(
+            outcome="REVIEW / HOLD",
+            evidence_state="INCONCLUSIVE_EVIDENCE",
+            reason_codes=["ASR_UNAVAILABLE"],
+            next_step_script=(
+                "Spoken challenge verification unavailable in LIVE mode (ASR_UNAVAILABLE). "
+                "Route to Non-Voice Accessibility Fallback: Trusted App Push, In-Store Biometric KYC, or Manager Callback."
+            ),
+            emit_risk_alert=False,
+        )
+
     # Matrix cell: speaker_decision == "match" and deepfake_verdict == "real"
     if protective_low_friction:
         return AuthorizationDecision(
@@ -303,7 +387,9 @@ def evaluate_voice_authorization(
         step_up_reasons.append("PRIVILEGED_APPROVAL_REQUIRED")
     if session.sector == "telecom" and session.after_hours:
         step_up_reasons.append("AFTER_HOURS_COOLING_HOLD")
-    if (
+    if session.sector == "banking" and critical_action and session.amount_inr is None:
+        step_up_reasons.append("AMOUNT_REQUIRED")
+    elif (
         session.sector == "banking"
         and session.amount_inr is not None
         and session.amount_inr >= GATEWAY_PROFILES["banking"]["amount_step_up_threshold_inr"]

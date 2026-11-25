@@ -1,13 +1,14 @@
-"""Database engine and session configuration for VoiceSuraksha-Sync."""
+"""Database engine, durability helpers, and schema migrations for VoiceSuraksha-Sync."""
 
 import os
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
+CURRENT_SCHEMA_VERSION = 2
 
 
 def get_database_url() -> str:
@@ -24,6 +25,11 @@ def get_storage_backend(database_url: str | None = None) -> str:
     if url.startswith("postgresql"):
         return "postgresql"
     return "sqlite_ephemeral"
+
+
+def is_storage_durable(database_url: str | None = None) -> bool:
+    """Return True when backed by managed PostgreSQL rather than ephemeral local SQLite."""
+    return get_storage_backend(database_url) == "postgresql"
 
 
 def _ensure_sqlite_parent_dir(url: str) -> None:
@@ -64,11 +70,48 @@ engine = create_db_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
+def run_schema_migrations(target_engine=None) -> None:
+    """Apply lightweight, idempotent schema migrations and record schema version."""
+    eng = target_engine or engine
+    inspector = inspect(eng)
+    is_postgres = eng.dialect.name == "postgresql"
+    bool_default = "FALSE" if is_postgres else "0"
+
+    with eng.begin() as conn:
+        for table_name in ("enrollments", "user_accounts"):
+            if inspector.has_table(table_name):
+                cols = {c["name"] for c in inspector.get_columns(table_name)}
+                if "privileged_role" not in cols:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {table_name} ADD COLUMN privileged_role BOOLEAN NOT NULL DEFAULT {bool_default}"
+                        )
+                    )
+
+        existing = conn.execute(
+            text("SELECT version FROM schema_version WHERE version = :ver"),
+            {"ver": CURRENT_SCHEMA_VERSION},
+        ).scalar_one_or_none()
+        if existing is None:
+            conn.execute(
+                text(
+                    "INSERT INTO schema_version (version, description, applied_at) "
+                    "VALUES (:ver, :desc, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "ver": CURRENT_SCHEMA_VERSION,
+                    "desc": "Add privileged_role subject attributes and schema_version tracking",
+                },
+            )
+
+
 def init_db(target_engine=None) -> None:
-    """Create all database tables if they do not exist."""
+    """Create all database tables and run lightweight migrations."""
     from app import models  # noqa: F401
 
-    Base.metadata.create_all(bind=target_engine or engine)
+    eng = target_engine or engine
+    Base.metadata.create_all(bind=eng)
+    run_schema_migrations(eng)
 
 
 def get_db() -> Generator[Session, None, None]:

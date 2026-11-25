@@ -18,19 +18,72 @@ load_dotenv(override=False)
 
 SESSION_COOKIE_NAME = "vs_session"
 TOKEN_TTL_SECONDS = 8 * 3600
-_EPHEMERAL_SECRET = secrets.token_urlsafe(32)
+MIN_SECRET_LENGTH = 16
+KNOWN_DEFAULT_SECRETS = {
+    "admin123",
+    "change_me_admin_password",
+    "change_me_long_random_secret",
+    "voicesuraksha-dev-webhook-secret",
+    "secret",
+    "password",
+    "changeme",
+    "default",
+}
+_EPHEMERAL_DEMO_AUTH_SECRET = secrets.token_urlsafe(32)
+_EPHEMERAL_DEMO_ADMIN_PASSWORD = secrets.token_urlsafe(24)
+
+
+def is_demo_mode() -> bool:
+    """Return True when DEMO_MODE=true."""
+    return os.getenv("DEMO_MODE", "false").strip().lower() == "true"
+
+
+def is_weak_secret(value: str | None) -> bool:
+    """Return True when a secret/password is missing, <16 chars, or matches known placeholders."""
+    clean = (value or "").strip()
+    if len(clean) < MIN_SECRET_LENGTH:
+        return True
+    low = clean.lower()
+    if low in KNOWN_DEFAULT_SECRETS:
+        return True
+    return low.startswith(("change_me", "replace_with", "your_"))
+
+
+def validate_live_secrets() -> None:
+    """Fail fast on startup in LIVE mode if critical secrets are missing, default, or <16 chars."""
+    if is_demo_mode():
+        return
+    load_dotenv(override=False)
+    bad: list[str] = []
+    for var_name in ("AUTH_SECRET", "WEBHOOK_SIGNING_SECRET", "ADMIN_PASSWORD"):
+        if is_weak_secret(os.getenv(var_name)):
+            bad.append(var_name)
+    if bad:
+        raise RuntimeError(
+            "LIVE mode startup blocked: missing, default, or <16-char security configuration for "
+            + ", ".join(bad)
+            + ". Set strong secrets or set DEMO_MODE=true for demo environments."
+        )
 
 
 def _get_auth_secret() -> bytes:
-    secret = os.getenv("AUTH_SECRET") or _EPHEMERAL_SECRET
+    secret = os.getenv("AUTH_SECRET", "").strip()
+    if is_weak_secret(secret):
+        if is_demo_mode():
+            return _EPHEMERAL_DEMO_AUTH_SECRET.encode("utf-8")
+        raise RuntimeError("AUTH_SECRET is missing or insecure (<16 chars / known default) in LIVE mode.")
     return secret.encode("utf-8")
 
 
 def get_admin_credentials() -> tuple[str, str]:
-    """Return configured admin username and password from environment."""
+    """Return configured admin username and validated password."""
     load_dotenv(override=False)
     username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
-    password = os.getenv("ADMIN_PASSWORD", "admin123")
+    password = os.getenv("ADMIN_PASSWORD", "").strip()
+    if is_weak_secret(password):
+        if is_demo_mode():
+            return username, _EPHEMERAL_DEMO_ADMIN_PASSWORD
+        raise RuntimeError("ADMIN_PASSWORD is missing or insecure (<16 chars / known default) in LIVE mode.")
     return username, password
 
 

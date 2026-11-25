@@ -27,6 +27,7 @@ class Enrollment(Base):
     consent_ref: Mapped[str] = mapped_column(String(128), nullable=False)
     audio_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     speech_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    privileged_role: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -131,6 +132,7 @@ class UserAccount(Base):
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     subject_ref: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    privileged_role: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -157,3 +159,13 @@ class RiskWebhookDispatch(Base):
     hmac_signature: Mapped[str] = mapped_column(String(128), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class SchemaVersion(Base):
+    """Schema migration tracking table for zero-downtime redeploys."""
+
+    __tablename__ = "schema_version"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    description: Mapped[str] = mapped_column(String(256), nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

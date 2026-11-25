@@ -1208,8 +1208,9 @@
         document.getElementById("health-text").textContent = `${health.mode} · ${health.status.toUpperCase()}`;
         const storagePill = document.getElementById("storage-pill");
         if (storagePill && health.storage_backend) {
-          storagePill.textContent = `DB: ${String(health.storage_backend).toUpperCase()}`;
-          storagePill.className = "pill " + (health.storage_backend === "postgresql" ? "ok" : "warn") + (state.user?.role === "admin" ? "" : " hidden");
+          const durability = health.durable ? "DURABLE" : "EPHEMERAL";
+          storagePill.textContent = `DB: ${String(health.storage_backend).toUpperCase()} (${durability})`;
+          storagePill.className = "pill " + (health.durable ? "ok" : "warn") + (state.user?.role === "admin" ? "" : " hidden");
         }
         await applyAuthState(me.authenticated ? me.user : null);
       } catch (err) {

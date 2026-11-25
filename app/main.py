@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
@@ -34,11 +36,13 @@ from app.auth import (
     get_current_actor,
     get_optional_actor,
     hash_password,
+    is_demo_mode,
     require_admin,
     set_session_cookie,
+    validate_live_secrets,
     verify_password,
 )
-from app.db import get_db, get_storage_backend, init_db
+from app.db import get_db, get_storage_backend, init_db, is_storage_durable
 from app.detectif_client import DetectifClient, DetectifProviderError
 from app.models import (
     AuditEvent,
@@ -76,6 +80,24 @@ SESSION_TTL_MINUTES = 2
 DECISION_TOKEN_TTL_MINUTES = 5
 RISK_EVENT_TTL_HOURS = 24
 POLICY_VERSION = "2026.11-fail-closed-v1"
+try:
+    IST_ZONE: Any = ZoneInfo("Asia/Kolkata")
+except ZoneInfoNotFoundError:
+    IST_ZONE = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
+logger = logging.getLogger("voicelock-gateway")
+
+
+def _is_ist_after_hours(now_utc: datetime | None = None) -> bool:
+    """Compute server-side after-hours flag in Asia/Kolkata (22:00-06:00 IST or weekend)."""
+    ts = _as_utc(now_utc or utcnow()).astimezone(IST_ZONE)
+    return ts.hour >= 22 or ts.hour < 6 or ts.weekday() >= 5
+
+
+def _is_subject_privileged(db: Session, subject_ref: str, enrollment: Enrollment | None = None) -> bool:
+    """Resolve server-side privileged_role attribute from Enrollment/UserAccount records."""
+    enr = enrollment or db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
+    acct = db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref))
+    return bool((enr and enr.privileged_role) or (acct and acct.privileged_role))
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -114,9 +136,20 @@ def get_detectif_client() -> DetectifClient:
     return DetectifClient()
 
 
+def get_asr_adapter() -> ServerASRAdapter:
+    """Dependency provider for ServerASRAdapter (overridable in tests)."""
+    return ServerASRAdapter()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    validate_live_secrets()
     init_db()
+    if not is_demo_mode() and not is_storage_durable():
+        logger.warning(
+            "Running in LIVE mode on ephemeral SQLite (%s). Configure DATABASE_URL=postgresql://... for durable persistence.",
+            get_storage_backend(),
+        )
     yield
 
 
@@ -163,6 +196,10 @@ class OfflineSwapCallbackRequest(BaseModel):
     after_hours: bool = False
 
 
+class SubjectPrivilegeRequest(BaseModel):
+    privileged_role: bool
+
+
 def _actor_dict(actor: AuthActor) -> dict[str, Any]:
     return {
         "username": actor.username,
@@ -199,6 +236,7 @@ def health(
         "service": "voicelock-gateway",
         "mode": "DEMO" if demo_mode else "LIVE",
         "storage_backend": get_storage_backend(),
+        "durable": is_storage_durable(),
         "profiles": list(GATEWAY_PROFILES.keys()),
     }
     if actor is not None:
@@ -500,11 +538,32 @@ def list_enrollments(
                 "consent_ref": r.consent_ref,
                 "audio_sha256": r.audio_sha256,
                 "speech_seconds": r.speech_seconds,
+                "privileged_role": bool(r.privileged_role),
                 "created_at": _as_utc(r.created_at).isoformat(),
             }
             for r in rows
         ]
     }
+
+
+@app.patch("/api/v1/admin/subjects/{subject_ref}/privilege")
+def set_subject_privilege(
+    subject_ref: str,
+    body: SubjectPrivilegeRequest,
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Set server-side privileged_role attribute for a subject (admin only)."""
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
+    account = db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref))
+    if enrollment is None and account is None:
+        raise HTTPException(status_code=404, detail=f"Subject '{subject_ref}' not found.")
+    if enrollment is not None:
+        enrollment.privileged_role = body.privileged_role
+    if account is not None:
+        account.privileged_role = body.privileged_role
+    db.commit()
+    return {"subject_ref": subject_ref, "privileged_role": bool(body.privileged_role)}
 
 
 @app.get("/api/v1/audit")
@@ -660,8 +719,8 @@ def trigger_offline_swap_callback(
         challenge_hash=challenge_hash,
         expires_at=expires_at,
         status="PENDING",
-        after_hours=body.after_hours,
-        privileged_role=False,
+        after_hours=_is_ist_after_hours(now),
+        privileged_role=_is_subject_privileged(db, body.subject_ref, enrollment),
         amount_inr=None,
     )
     db.add(session)
@@ -776,10 +835,11 @@ def create_verification_session(
     if enrollment is None:
         raise HTTPException(status_code=404, detail=f"Subject '{body.subject_ref}' is not enrolled.")
 
+    now = utcnow()
     session_id = str(uuid.uuid4())
     challenge_text = generate_challenge_phrase(body.sector, body.action, body.resource_ref)
     challenge_hash = hash_text_sha256(normalize_transcript(challenge_text))
-    expires_at = utcnow() + timedelta(minutes=SESSION_TTL_MINUTES)
+    expires_at = now + timedelta(minutes=SESSION_TTL_MINUTES)
 
     session = VerificationSession(
         session_id=session_id,
@@ -791,9 +851,9 @@ def create_verification_session(
         challenge_hash=challenge_hash,
         expires_at=expires_at,
         status="PENDING",
-        after_hours=body.after_hours,
-        privileged_role=body.privileged_role,
-        amount_inr=body.amount_inr,
+        after_hours=_is_ist_after_hours(now),
+        privileged_role=_is_subject_privileged(db, body.subject_ref, enrollment),
+        amount_inr=body.amount_inr if actor.role == "admin" else None,
     )
     db.add(session)
     db.commit()
@@ -820,9 +880,10 @@ async def submit_verification_audio(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
+    asr_adapter: ServerASRAdapter = Depends(get_asr_adapter),
     actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
-    """Call DetectifAI Eidos+Aletheia to verify voice, evaluate policy, and issue one-time token on PASS."""
+    """Call DetectifAI Eidos+Aletheia & hosted ASR to verify voice, evaluate policy, and issue one-time token on PASS."""
     session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
     if session is None:
         raise HTTPException(status_code=404, detail="Verification session not found.")
@@ -837,10 +898,9 @@ async def submit_verification_audio(
     wav_duration = _inspect_wav_duration(wav_bytes) if wav_bytes else None
     audio_digest = hashlib.sha256(wav_bytes).hexdigest() if wav_bytes else None
 
-    if not spoken_transcript:
-        asr_result = ServerASRAdapter().transcribe_wav(wav_bytes)
-        if asr_result.transcript:
-            spoken_transcript = asr_result.transcript
+    action_meta = validate_sector_action(session.sector, session.action)
+    is_critical = bool(action_meta.get("critical", False))
+    demo_mode = is_demo_mode()
 
     active_risks = db.scalars(
         select(RiskEvent).where(
@@ -851,7 +911,6 @@ async def submit_verification_audio(
     unexpired_risks = [r for r in active_risks if _as_utc(r.expires_at) > now]
 
     is_expired = now > _as_utc(session.expires_at)
-    phrase_match = verify_phrase_match(session.challenge_text, spoken_transcript)
 
     replayed_telemetry = (
         db.scalar(
@@ -868,17 +927,31 @@ async def submit_verification_audio(
     )
 
     quality_report: AudioQualityReport | None = None
-    if (
-        replayed_telemetry is None
-        and not is_expired
-        and wav_bytes
-        and (wav_duration is None or wav_duration >= 4.0)
-        and (phrase_match or not strict_phrase)
-    ):
+    if replayed_telemetry is None and not is_expired and wav_bytes and (wav_duration is None or wav_duration >= 4.0):
         quality_report = inspect_pcm_wav_quality(wav_bytes)
-
     quality_failed = bool(quality_report is not None and quality_report.valid_wav and not quality_report.passed)
-    should_call_provider = not is_expired and replayed_telemetry is None and not quality_failed and (phrase_match or not strict_phrase)
+
+    asr_available = True
+    effective_transcript = ""
+    if not is_expired and replayed_telemetry is None and not quality_failed:
+        if demo_mode and spoken_transcript.strip():
+            effective_transcript = spoken_transcript
+            asr_available = True
+        else:
+            asr_res = asr_adapter.transcribe_wav(wav_bytes)
+            asr_available = asr_res.available
+            effective_transcript = asr_res.transcript or ""
+            # Client transcript is completely ignored in LIVE mode (DEMO_MODE=false)
+
+    require_phrase = is_critical or (demo_mode and strict_phrase)
+    phrase_match = verify_phrase_match(session.challenge_text, effective_transcript)
+    phrase_blocked_before_provider = require_phrase and asr_available and not phrase_match
+    should_call_provider = (
+        not is_expired
+        and replayed_telemetry is None
+        and not quality_failed
+        and not phrase_blocked_before_provider
+    )
 
     provider_res = None
     provider_error: str | None = None
@@ -900,7 +973,6 @@ async def submit_verification_audio(
                 provider_error = exc.error_code
 
     if replayed_telemetry is not None:
-        action_meta = validate_sector_action(session.sector, session.action)
         evaluation = AuthorizationDecision(
             outcome="REJECT_REQUEST",
             evidence_state="REPLAY_DETECTED",
@@ -908,7 +980,7 @@ async def submit_verification_audio(
             next_step_script=(
                 "Request blocked: identical verification WAV audio was already submitted in a prior session."
             ),
-            emit_risk_alert=(session.sector == "telecom" and bool(action_meta.get("critical", False))),
+            emit_risk_alert=(session.sector == "telecom" and is_critical),
         )
     elif quality_failed:
         evaluation = AuthorizationDecision(
@@ -947,7 +1019,8 @@ async def submit_verification_audio(
             privileged_role=session.privileged_role,
             amount_inr=session.amount_inr,
             expired=is_expired,
-            require_phrase_match=strict_phrase,
+            require_phrase_match=require_phrase,
+            asr_available=asr_available,
         )
         evaluation = evaluate_voice_authorization(
             session=policy_session,
