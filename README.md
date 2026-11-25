@@ -8,6 +8,15 @@ Action-bound voice-security gateway powered by **DetectifAI Eidos** (`/v1/speake
 - **Frontend**: Single-file SOC UI served directly by FastAPI at `/` (`frontend/index.html`) — no CORS or separate build step.
 - **Privacy & Security**: Raw audio is **never** stored in SQLite; only SHA-256 digests, pseudonymous `subject_ref` IDs, provider scores/verdicts, and single-use decision token hashes are persisted. `DETECTIF_API_KEY` is loaded server-side from `.env` only.
 
+## Outcome Vocabulary (`CANONICAL_OUTCOMES`)
+
+Every backend endpoint, audit event, JSON dossier, and dashboard panel uses one consistent set of outcomes:
+
+- **`APPROVED`**: Voice biometrics (`Eidos`), liveness (`Aletheia`), and spoken challenge passed with zero blocking context (or completed `STEP-UP` / reviewer approval) — issues one single-use `decision_token`.
+- **`STEP-UP`**: Acoustic match succeeded, but contextual controls (`AFTER_HOURS_COOLING_HOLD`, `PRIVILEGED_APPROVAL_REQUIRED`, `AMOUNT_REQUIRED`, `HIGH_VALUE_STEP_UP`, or active `CROSS_DOMAIN_ALERT`) require simulated out-of-band confirmation (`trusted_app_push`, `manager_callback`, `in_store_kyc`).
+- **`REVIEW / HOLD`**: Evidence was inconclusive or unavailable (`AUDIO_QUALITY_LOW` for silent/clipped/`<4s` WAV, `PROVIDER_UNAVAILABLE`, `ASR_UNAVAILABLE`) — genuine users are never auto-cancelled and always receive the three non-voice fallback options.
+- **`REJECTED`**: Clear negative evidence (`DEEPFAKE_SIGNAL`, `SPEAKER_NO_MATCH`, `AUDIO_REPLAY_DETECTED`, `CHALLENGE_MISMATCH`, `CHALLENGE_EXPIRED`, or reviewer rejection).
+
 ## Gateway Profiles (`GATEWAY_PROFILES`)
 
 1. `telecom` (**LIVE MVP**): `sim_replacement`, `esim_transfer`, `mnp_port_out`, `emergency_sim_block` (`after_hours_step_up`, emits simulated `SIM_SWAP_ATTEMPT_BLOCKED` alerts)

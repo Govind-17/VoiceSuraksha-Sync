@@ -15,7 +15,7 @@ import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -58,6 +58,7 @@ from app.models import (
 )
 from app.policy import (
     GATEWAY_PROFILES,
+    NON_VOICE_FALLBACK_OPTIONS,
     AuthorizationDecision,
     SessionPolicyInput,
     VoiceEvidenceInput,
@@ -198,6 +199,21 @@ class OfflineSwapCallbackRequest(BaseModel):
 
 class SubjectPrivilegeRequest(BaseModel):
     privileged_role: bool
+
+
+class CompleteStepUpRequest(BaseModel):
+    method: Literal["trusted_app_push", "manager_callback", "in_store_kyc"]
+    amount_inr: float | None = Field(None, gt=0)
+    note: str = Field("", max_length=256)
+
+
+class ReviewDecisionRequest(BaseModel):
+    decision: Literal["APPROVED", "REJECTED"]
+    reason: str = Field(..., min_length=3, max_length=256)
+
+
+class ResolveAlertRequest(BaseModel):
+    resolution_note: str = Field("Resolved by SOC administrator", min_length=2, max_length=256)
 
 
 def _actor_dict(actor: AuthActor) -> dict[str, Any]:
@@ -600,7 +616,9 @@ def _emit_signed_risk_event(
     demo_flag: bool = True,
 ) -> tuple[RiskEvent, dict[str, Any]]:
     """Persist a cross-domain RiskEvent and attach an HMAC-SHA256 webhook signature."""
-    expires_at = now + timedelta(hours=RISK_EVENT_TTL_HOURS)
+    ttl_min_env = os.getenv("RISK_ALERT_TTL_MINUTES", "").strip()
+    ttl_delta = timedelta(minutes=int(ttl_min_env)) if ttl_min_env.isdigit() else timedelta(hours=RISK_EVENT_TTL_HOURS)
+    expires_at = now + ttl_delta
     risk_row = RiskEvent(
         source_sector=source_sector,
         subject_ref=subject_ref,
@@ -637,6 +655,7 @@ def _emit_signed_risk_event(
         "event_type": risk_row.event_type,
         "subject_ref": risk_row.subject_ref,
         "risk_state": risk_row.risk_state,
+        "expires_at": _as_utc(risk_row.expires_at).isoformat(),
         "demo_flag": risk_row.demo_flag,
         "hmac_signature": signature,
         "signed_payload": signed_payload,
@@ -648,7 +667,8 @@ def list_risk_events(
     db: Session = Depends(get_db),
     _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
-    """List cross-domain risk events with HMAC webhook signatures (admin only)."""
+    """List cross-domain risk events with TTL status and HMAC webhook signatures (admin only)."""
+    now = utcnow()
     rows = db.scalars(select(RiskEvent).order_by(RiskEvent.id.desc())).all()
     dispatches = {
         d.risk_event_id: d
@@ -657,21 +677,61 @@ def list_risk_events(
     items: list[dict[str, Any]] = []
     for r in rows:
         dispatch = dispatches.get(r.id)
-        item = {
-            "id": r.id,
-            "source_sector": r.source_sector,
-            "subject_ref": r.subject_ref,
-            "event_type": r.event_type,
-            "source_case_ref": r.source_case_ref,
-            "risk_state": r.risk_state,
-            "occurred_at": _as_utc(r.occurred_at).isoformat(),
-            "expires_at": _as_utc(r.expires_at).isoformat(),
-            "demo_flag": r.demo_flag,
-            "hmac_signature": dispatch.hmac_signature if dispatch else None,
-            "signed_payload": json.loads(dispatch.payload_json) if dispatch else None,
-        }
-        items.append(item)
+        expired = _as_utc(r.expires_at) <= now
+        items.append(
+            {
+                "id": r.id,
+                "source_sector": r.source_sector,
+                "subject_ref": r.subject_ref,
+                "event_type": r.event_type,
+                "source_case_ref": r.source_case_ref,
+                "risk_state": r.risk_state,
+                "expired": expired,
+                "occurred_at": _as_utc(r.occurred_at).isoformat(),
+                "expires_at": _as_utc(r.expires_at).isoformat(),
+                "demo_flag": r.demo_flag,
+                "hmac_signature": dispatch.hmac_signature if dispatch else None,
+                "signed_payload": json.loads(dispatch.payload_json) if dispatch else None,
+            }
+        )
     return {"risk_events": items}
+
+
+@app.post("/api/v1/risk-events/{event_id}/resolve")
+def resolve_risk_event(
+    event_id: int,
+    body: ResolveAlertRequest | None = None,
+    db: Session = Depends(get_db),
+    admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Resolve an active cross-domain RiskEvent (admin only)."""
+    risk_row = db.scalar(select(RiskEvent).where(RiskEvent.id == event_id))
+    if risk_row is None:
+        raise HTTPException(status_code=404, detail=f"Risk event {event_id} not found.")
+    if risk_row.risk_state != "ACTIVE":
+        raise HTTPException(status_code=409, detail=f"Risk event {event_id} is already '{risk_row.risk_state}'.")
+
+    now = utcnow()
+    note = body.resolution_note.strip() if body else "Resolved by SOC administrator"
+    risk_row.risk_state = "RESOLVED"
+    db.add(
+        AuditEvent(
+            session_id=risk_row.source_case_ref,
+            sector=risk_row.source_sector,
+            action="risk_alert_resolve",
+            outcome="APPROVED",
+            reason_codes_json=json.dumps(["RISK_ALERT_RESOLVED"]),
+            created_at=now,
+        )
+    )
+    db.commit()
+    return {
+        "id": risk_row.id,
+        "risk_state": risk_row.risk_state,
+        "resolved_by": admin.username,
+        "resolved_at": now.isoformat(),
+        "resolution_note": note,
+    }
 
 
 @app.post("/api/v1/demo/clear-alerts")
@@ -729,8 +789,8 @@ def trigger_offline_swap_callback(
             session_id=session_id,
             sector="telecom",
             action="sim_replacement",
-            outcome="CALLBACK_TRIGGERED",
-            reason_codes_json=json.dumps(["OFFLINE_RETAIL_SIM_SWAP"]),
+            outcome="STEP-UP",
+            reason_codes_json=json.dumps(["OFFLINE_RETAIL_SIM_SWAP", "CALLBACK_TRIGGERED"]),
             created_at=now,
         )
     )
@@ -974,11 +1034,11 @@ async def submit_verification_audio(
 
     if replayed_telemetry is not None:
         evaluation = AuthorizationDecision(
-            outcome="REJECT_REQUEST",
+            outcome="REJECTED",
             evidence_state="REPLAY_DETECTED",
             reason_codes=["AUDIO_REPLAY_DETECTED"],
             next_step_script=(
-                "Request blocked: identical verification WAV audio was already submitted in a prior session."
+                "Request rejected: identical verification WAV audio was already submitted in a prior session."
             ),
             emit_risk_alert=(session.sector == "telecom" and is_critical),
         )
@@ -1119,6 +1179,8 @@ async def submit_verification_audio(
         else None
     )
 
+    fallback_options = NON_VOICE_FALLBACK_OPTIONS if evaluation.outcome in {"REVIEW / HOLD", "STEP-UP"} else []
+
     if actor.role != "admin":
         return {
             "session_id": session.session_id,
@@ -1128,6 +1190,7 @@ async def submit_verification_audio(
             "outcome": evaluation.outcome,
             "reason_codes": evaluation.reason_codes,
             "next_step_script": evaluation.next_step_script,
+            "fallback_options": fallback_options,
             "audio_quality": quality_payload,
             "voice_summary": {
                 "speaker_decision": voice_row.speaker_decision,
@@ -1144,6 +1207,7 @@ async def submit_verification_audio(
         "outcome": evaluation.outcome,
         "reason_codes": evaluation.reason_codes,
         "next_step_script": evaluation.next_step_script,
+        "fallback_options": fallback_options,
         "audio_quality": quality_payload,
         "decision_token": plaintext_token,
         "token_expires_at": token_expires_at.isoformat() if token_expires_at else None,
@@ -1201,8 +1265,8 @@ def consume_decision_token(
             session_id=session.session_id,
             sector=session.sector,
             action=session.action,
-            outcome="TOKEN_CONSUMED",
-            reason_codes_json=json.dumps(["ACTION_RELEASED"]),
+            outcome="APPROVED",
+            reason_codes_json=json.dumps(["TOKEN_CONSUMED", "ACTION_RELEASED"]),
             created_at=now,
         )
     )
@@ -1215,6 +1279,220 @@ def consume_decision_token(
         "action": session.action,
         "resource_ref": session.resource_ref,
         "consumed_at": now.isoformat(),
+    }
+
+
+@app.post("/api/v1/decisions/{session_id}/step-up/complete")
+def complete_step_up(
+    session_id: str,
+    body: CompleteStepUpRequest,
+    db: Session = Depends(get_db),
+    actor: AuthActor = Depends(get_current_actor),
+) -> dict[str, Any]:
+    """Complete a simulated out-of-band STEP-UP confirmation and issue a single one-time token."""
+    session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
+    decision = db.scalar(select(Decision).where(Decision.session_id == session_id))
+    if session is None or decision is None:
+        raise HTTPException(status_code=404, detail="Verification session or decision not found.")
+    if actor.role != "admin" and session.subject_ref != actor.subject_ref:
+        raise HTTPException(status_code=403, detail="Cannot complete step-up for another user's session.")
+    if body.amount_inr is not None and actor.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin/backend callers may supply banking amount_inr.")
+
+    if decision.outcome == "APPROVED" or decision.token_hash is not None or session.status == "APPROVED":
+        raise HTTPException(
+            status_code=409,
+            detail="Step-up has already been completed and a one-time token was already issued.",
+        )
+    if decision.outcome != "STEP-UP":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session outcome '{decision.outcome}' is not in STEP-UP state.",
+        )
+
+    now = utcnow()
+    action_meta = validate_sector_action(session.sector, session.action)
+    is_critical = bool(action_meta.get("critical", False))
+    reasons = json.loads(decision.reason_codes_json)
+    threshold_eval: dict[str, Any] | None = None
+
+    if session.sector == "banking" and is_critical:
+        effective_amount = float(body.amount_inr) if body.amount_inr is not None else session.amount_inr
+        if effective_amount is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Admin/backend amount_inr is required to resolve Banking AMOUNT_REQUIRED step-up.",
+            )
+        session.amount_inr = effective_amount
+        thresh = float(GATEWAY_PROFILES["banking"]["amount_step_up_threshold_inr"])
+        is_high_value = effective_amount >= thresh
+        threshold_eval = {"amount_inr": effective_amount, "threshold_inr": thresh, "high_value": is_high_value}
+        if is_high_value and body.method == "trusted_app_push":
+            reasons = ["HIGH_VALUE_STEP_UP"]
+            decision.reason_codes_json = json.dumps(reasons)
+            decision.next_step_script = (
+                f"Amount INR {effective_amount:,.0f} exceeds INR {thresh:,.0f} high-value threshold: "
+                "complete step-up using simulated manager_callback or in_store_kyc."
+            )
+            db.add(
+                AuditEvent(
+                    session_id=session.session_id,
+                    sector=session.sector,
+                    action=session.action,
+                    outcome="STEP-UP",
+                    reason_codes_json=json.dumps(["HIGH_VALUE_THRESHOLD_EVALUATED", "HIGH_VALUE_STEP_UP"]),
+                    created_at=now,
+                )
+            )
+            db.commit()
+            return {
+                "session_id": session.session_id,
+                "status": session.status,
+                "outcome": "STEP-UP",
+                "method": body.method,
+                "simulated": True,
+                "reason_codes": reasons,
+                "threshold_evaluation": threshold_eval,
+                "decision_token": None,
+                "token_expires_at": None,
+                "next_step_script": decision.next_step_script,
+            }
+        reasons = [r for r in reasons if r != "AMOUNT_REQUIRED"]
+        if is_high_value and "HIGH_VALUE_THRESHOLD_VERIFIED" not in reasons:
+            reasons.append("HIGH_VALUE_THRESHOLD_VERIFIED")
+
+    plaintext_token = secrets.token_urlsafe(32)
+    token_expires_at = now + timedelta(minutes=DECISION_TOKEN_TTL_MINUTES)
+    decision.outcome = "APPROVED"
+    decision.token_hash = hash_text_sha256(plaintext_token)
+    decision.expires_at = token_expires_at
+    decision.reason_codes_json = json.dumps([*reasons, "STEP_UP_COMPLETED"])
+    decision.next_step_script = (
+        f"Simulated {body.method} confirmation verified. Approved to proceed with one-time action token."
+    )
+    session.status = "APPROVED"
+
+    db.add(
+        AuditEvent(
+            session_id=session.session_id,
+            sector=session.sector,
+            action=session.action,
+            outcome="APPROVED",
+            reason_codes_json=json.dumps(["STEP_UP_COMPLETED", f"METHOD_{body.method.upper()}", "SIMULATED_CHANNEL"]),
+            created_at=now,
+        )
+    )
+    db.commit()
+
+    return {
+        "session_id": session.session_id,
+        "status": session.status,
+        "outcome": decision.outcome,
+        "method": body.method,
+        "simulated": True,
+        "reason_codes": json.loads(decision.reason_codes_json),
+        "threshold_evaluation": threshold_eval,
+        "decision_token": plaintext_token,
+        "token_expires_at": token_expires_at.isoformat(),
+        "next_step_script": decision.next_step_script,
+    }
+
+
+@app.get("/api/v1/admin/review-queue")
+def get_admin_review_queue(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """List HOLD and STEP_UP sessions awaiting admin review or out-of-band confirmation."""
+    sessions = db.scalars(
+        select(VerificationSession)
+        .where(VerificationSession.status.in_(["HOLD", "STEP_UP"]))
+        .order_by(VerificationSession.expires_at.desc())
+    ).all()
+    items: list[dict[str, Any]] = []
+    for s in sessions:
+        dec = db.scalar(select(Decision).where(Decision.session_id == s.session_id))
+        items.append(
+            {
+                "session_id": s.session_id,
+                "sector": s.sector,
+                "subject_ref": s.subject_ref,
+                "action": s.action,
+                "resource_ref": s.resource_ref,
+                "status": s.status,
+                "outcome": dec.outcome if dec else ("REVIEW / HOLD" if s.status == "HOLD" else "STEP-UP"),
+                "reason_codes": json.loads(dec.reason_codes_json) if dec else [],
+                "amount_inr": s.amount_inr,
+                "expires_at": _as_utc(s.expires_at).isoformat(),
+                "fallback_options": NON_VOICE_FALLBACK_OPTIONS,
+            }
+        )
+    return {"review_queue": items}
+
+
+@app.post("/api/v1/decisions/{session_id}/review")
+def review_held_decision(
+    session_id: str,
+    body: ReviewDecisionRequest,
+    db: Session = Depends(get_db),
+    admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Manually approve or reject a HOLD or STEP_UP session with required reason & timestamp."""
+    session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
+    decision = db.scalar(select(Decision).where(Decision.session_id == session_id))
+    if session is None or decision is None:
+        raise HTTPException(status_code=404, detail="Session or decision not found.")
+    if session.status not in {"HOLD", "STEP_UP"} or decision.token_hash is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session status '{session.status}' is not awaiting reviewer action.",
+        )
+
+    clean_reason = body.reason.strip()
+    if len(clean_reason) < 3:
+        raise HTTPException(status_code=400, detail="A non-empty review reason (min 3 chars) is required.")
+
+    now = utcnow()
+    plaintext_token: str | None = None
+    token_expires_at: datetime | None = None
+
+    if body.decision == "APPROVED":
+        plaintext_token = secrets.token_urlsafe(32)
+        token_expires_at = now + timedelta(minutes=DECISION_TOKEN_TTL_MINUTES)
+        decision.token_hash = hash_text_sha256(plaintext_token)
+        decision.expires_at = token_expires_at
+        session.status = "APPROVED"
+        audit_code = "REVIEWER_APPROVED"
+    else:
+        session.status = "CANCELLED"
+        audit_code = "REVIEWER_REJECTED"
+
+    existing_reasons = json.loads(decision.reason_codes_json)
+    decision.outcome = body.decision
+    decision.reason_codes_json = json.dumps([*existing_reasons, audit_code])
+    decision.next_step_script = f"Reviewer ({admin.username}) recorded {body.decision}: {clean_reason}"
+
+    db.add(
+        AuditEvent(
+            session_id=session.session_id,
+            sector=session.sector,
+            action=session.action,
+            outcome=body.decision,
+            reason_codes_json=json.dumps([audit_code, f"REASON:{clean_reason[:80]}"]),
+            created_at=now,
+        )
+    )
+    db.commit()
+
+    return {
+        "session_id": session.session_id,
+        "status": session.status,
+        "outcome": decision.outcome,
+        "reason": clean_reason,
+        "reviewer": admin.username,
+        "reviewed_at": now.isoformat(),
+        "decision_token": plaintext_token,
+        "token_expires_at": token_expires_at.isoformat() if token_expires_at else None,
     }
 
 
@@ -1241,7 +1519,8 @@ def get_gateway_metrics(
     decisions = db.scalars(select(Decision)).all()
     total_verifications = len(decisions)
     pass_count = sum(1 for d in decisions if d.outcome == "APPROVED")
-    blocked_count = sum(1 for d in decisions if d.outcome in {"REJECTED", "REJECT_REQUEST"})
+    blocked_count = sum(1 for d in decisions if d.outcome == "REJECTED")
+    hold_count = sum(1 for d in decisions if d.outcome == "REVIEW / HOLD")
     step_up_count = sum(1 for d in decisions if d.outcome == "STEP-UP")
 
     latencies = [
@@ -1264,6 +1543,7 @@ def get_gateway_metrics(
     return {
         "total_verifications": total_verifications,
         "blocked_count": blocked_count,
+        "hold_count": hold_count,
         "pass_count": pass_count,
         "step_up_count": step_up_count,
         "p50_latency_ms": p50_latency_ms,
@@ -1489,7 +1769,7 @@ def run_redteam_sandbox(
             action="mfa_reset",
             resource_ref=f"SANDBOX-503-{short_tag}",
             expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
-            status="CANCELLED",
+            status="HOLD",
         )
         eval_res = evaluate_voice_authorization(
             session=SessionPolicyInput(
@@ -1515,7 +1795,7 @@ def run_redteam_sandbox(
             expires_at=None,
             consumed_at=None,
         )
-        detail = "Upstream provider 503 failed closed (REJECTED / CANCELLED)."
+        detail = "Upstream provider 503 moved session to REVIEW / HOLD with non-voice fallback (fail-closed)."
 
     else:  # cross_domain_sim_alert
         target_subject = "SUB-SANDBOX"
@@ -1536,7 +1816,7 @@ def run_redteam_sandbox(
             action="card_replacement",
             resource_ref=f"SANDBOX-BANK-{short_tag}",
             expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
-            status="CANCELLED",
+            status="STEP_UP",
         )
         eval_res = evaluate_voice_authorization(
             session=SessionPolicyInput(
@@ -1554,7 +1834,7 @@ def run_redteam_sandbox(
             phrase_match=True,
             active_risk_events=[risk_row],
         )
-        http_status = 403
+        http_status = 200
         reason_codes = [*eval_res.reason_codes, "SANDBOX_TEST"]
         outcome = eval_res.outcome
         dec = Decision(
@@ -1566,7 +1846,7 @@ def run_redteam_sandbox(
             expires_at=None,
             consumed_at=None,
         )
-        detail = "Blocked Telecom SIM swap propagated ACTIVE risk event -> Banking card replacement blocked (REJECTED)."
+        detail = "Blocked Telecom SIM swap propagated ACTIVE risk event -> Banking card replacement escalated to STEP-UP."
 
     db.add(sess)
     db.flush()

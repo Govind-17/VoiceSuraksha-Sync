@@ -717,7 +717,10 @@
             <strong style="font-size:14px;">SIMULATED CROSS-DOMAIN ALERT: <span style="font-family:var(--mono);">SIM_SWAP_ATTEMPT_BLOCKED</span></strong>
             <div class="small" id="cross-domain-detail" style="color:#7F1D1D;margin-top:2px;">Active telecom alert detected for subject.</div>
           </div>
-          <button class="btn btn-danger btn-sm" onclick="inspectBankingImpact()">Inspect Banking Preset Impact</button>
+          <div class="btn-row">
+            <button class="btn btn-danger btn-sm" onclick="inspectBankingImpact()">Inspect Banking Preset Impact</button>
+            <button class="btn btn-secondary btn-sm" id="btn-resolve-alert" onclick="resolveActiveAlert()">Resolve Alert</button>
+          </div>
         </div>
 
         <div class="ws-grid">
@@ -924,6 +927,28 @@
           </div>
         </div>
 
+        <!-- Admin Reviewer Queue (HOLD & STEP-UP) -->
+        <div class="obsidian-card" id="review-queue-card" style="margin-bottom:20px;">
+          <div class="card-hdr">
+            <div class="card-title"><span class="step-tag">REVIEWER QUEUE</span> HOLD &amp; STEP-UP Sessions</div>
+            <button type="button" class="btn-obsidian-ghost" onclick="refreshAdminPanels()">Refresh Queue</button>
+          </div>
+          <p class="small" style="color:#94A3B8;margin:0 0 12px;">
+            Review <code style="color:#28CB8B;">REVIEW / HOLD</code> and <code style="color:#28CB8B;">STEP-UP</code> cases with a required audit reason, or trigger simulated out-of-band confirmation to issue a single-use action token.
+          </p>
+          <div class="form-row" style="margin-bottom:12px;">
+            <label for="review-reason-input" style="color:#CBD5E1;">Required Reviewer Reason (audit-logged with timestamp)</label>
+            <input type="text" id="review-reason-input" placeholder="e.g. Verified customer via manager callback / KYC check" style="background:#0B1117;color:#F8FAFC;border-color:rgba(40,203,139,0.35);" />
+          </div>
+          <div class="table-wrap" style="border-color:rgba(40,203,139,0.28);background:#0B1117;">
+            <table>
+              <thead><tr><th style="background:#141E26;color:#CBD5E1;">Session</th><th style="background:#141E26;color:#CBD5E1;">Subject</th><th style="background:#141E26;color:#CBD5E1;">Action</th><th style="background:#141E26;color:#CBD5E1;">Outcome</th><th style="background:#141E26;color:#CBD5E1;">Reasons</th><th style="background:#141E26;color:#CBD5E1;">Reviewer Decision / Simulated Step-Up</th></tr></thead>
+              <tbody id="review-queue-tbody"><tr><td colspan="6" class="small" style="color:#94A3B8;">No HOLD or STEP-UP sessions pending review.</td></tr></tbody>
+            </table>
+          </div>
+          <div class="status-line" id="review-queue-status" style="background:rgba(255,255,255,0.04);color:#CBD5E1;">Reviewer actions write an immutable AuditEvent with timestamp.</div>
+        </div>
+
         <!-- Red-Team Attack Sandbox -->
         <div class="obsidian-card" id="sandbox">
           <div class="card-hdr">
@@ -948,11 +973,11 @@
             </button>
             <button class="sandbox-btn" onclick="runSandboxScenario('provider_outage_fail_closed')">
               <strong>Provider 503 Fail-Closed</strong>
-              <span>Expected: HTTP 503</span>
+              <span>Expected: REVIEW / HOLD</span>
             </button>
             <button class="sandbox-btn" onclick="runSandboxScenario('cross_domain_sim_alert')">
               <strong>Cross-Domain SIM→Bank</strong>
-              <span>Expected: HTTP 403 REJECTED</span>
+              <span>Expected: STEP-UP</span>
             </button>
           </div>
           <div class="sandbox-results" id="sandbox-results">
@@ -1461,8 +1486,8 @@
       try {
         const res = await apiJson(`/api/v1/verification-sessions/${state.userSession.session_id}/audio`, { method: "POST", body: fd });
         const oPill = document.getElementById("u-outcome-pill");
-        const isBlock = res.outcome === "REJECTED" || res.outcome === "REJECT_REQUEST";
-        oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : isBlock ? `${res.outcome} — REQUEST CANCELLED` : res.outcome;
+        const isBlock = res.outcome === "REJECTED";
+        oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : isBlock ? "REJECTED — REQUEST CANCELLED" : res.outcome;
         oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : isBlock ? "bad" : "warn");
         document.getElementById("u-next-step").textContent = res.next_step_script || "";
         const showFallback = res.evidence_state === "INCONCLUSIVE_EVIDENCE" || (res.reason_codes || []).includes("AUDIO_QUALITY_LOW");
@@ -1502,12 +1527,13 @@
 
     async function refreshAdminPanels() {
       try {
-        const [health, enrollRes, auditRes, riskRes, metrics] = await Promise.all([
+        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/enrollments"),
           apiJson("/api/v1/audit"),
           apiJson("/api/v1/risk-events"),
-          apiJson("/api/v1/metrics")
+          apiJson("/api/v1/metrics"),
+          apiJson("/api/v1/admin/review-queue")
         ]);
         const enrolledCount = String(health.enrolled_count ?? (enrollRes.enrollments || []).length);
         document.getElementById("enrolled-count").textContent = enrolledCount;
@@ -1523,9 +1549,10 @@
         renderSubjectDropdown();
         renderEnrolledTable(state.enrollments);
         state.riskEvents = riskRes.risk_events || [];
-        document.getElementById("stat-risks").textContent = String(state.riskEvents.length);
+        document.getElementById("stat-risks").textContent = String(state.riskEvents.filter(r => r.risk_state === "ACTIVE" && !r.expired).length);
         refreshRiskBanner();
         renderPresetBox();
+        renderReviewQueue(reviewRes.review_queue || []);
 
         const audits = auditRes.audit_events || [];
         document.getElementById("stat-audits").textContent = String(audits.length);
@@ -1619,9 +1646,29 @@
       const banner = document.getElementById("cross-domain-banner");
       if (active) {
         document.getElementById("cross-domain-detail").textContent = `Subject ${active.subject_ref} triggered ${active.event_type} from ${active.source_sector} (case ${active.source_case_ref}, simulated=${active.demo_flag}).`;
-        banner.dataset.subject = active.subject_ref; banner.classList.add("visible");
-      } else { banner.classList.remove("visible"); }
+        banner.dataset.subject = active.subject_ref;
+        banner.dataset.eventId = String(active.id);
+        banner.classList.add("visible");
+      } else {
+        banner.dataset.eventId = "";
+        banner.classList.remove("visible");
+      }
       renderPresetBox();
+    }
+
+    async function resolveActiveAlert() {
+      const eventId = document.getElementById("cross-domain-banner")?.dataset?.eventId;
+      if (!eventId) return;
+      try {
+        await apiJson(`/api/v1/risk-events/${encodeURIComponent(eventId)}/resolve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ resolution_note: "Resolved in Admin SOC after verification" })
+        });
+        await refreshAdminPanels();
+      } catch (err) {
+        alert(`Resolve alert failed: ${err.message}`);
+      }
     }
 
     function inspectBankingImpact() {
@@ -1830,11 +1877,71 @@
       const tbody = document.getElementById("audit-tbody");
       if (!rows.length) { tbody.innerHTML = `<tr><td colspan="7" class="small">No audit events recorded yet.</td></tr>`; return; }
       tbody.innerHTML = rows.slice(0, 25).map(r => {
-        const color = r.outcome === "APPROVED" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : (r.outcome === "REJECTED" || r.outcome === "REJECT_REQUEST") ? "var(--error)" : "#9A6700";
+        const color = r.outcome === "APPROVED" ? "var(--success)" : r.outcome === "REJECTED" ? "var(--error)" : "#9A6700";
         const ts = r.created_at ? new Date(r.created_at).toISOString().slice(11, 19) : "--";
         const sid = String(r.session_id || "");
         return `<tr><td>${escapeHtml(ts)}</td><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td><td>${escapeHtml((r.reason_codes || []).join(", ") || "—")}</td><td>${escapeHtml(sid.slice(0, 8))}…</td><td><button type="button" class="btn btn-ghost btn-sm" onclick="exportAuditDossier('${escapeHtml(sid)}')">Export Audit JSON</button></td></tr>`;
       }).join("");
+    }
+
+    function renderReviewQueue(items) {
+      const tbody = document.getElementById("review-queue-tbody");
+      if (!tbody) return;
+      if (!items.length) {
+        tbody.innerHTML = `<tr><td colspan="6" class="small" style="color:#94A3B8;">No HOLD or STEP-UP sessions pending review.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = items.map(item => {
+        const sid = escapeHtml(item.session_id);
+        const stepUpBtn = item.outcome === "STEP-UP"
+          ? `<button type="button" class="btn-obsidian-ghost" onclick="completeStepUpFromQueue('${sid}', 'manager_callback')">Sim Manager Callback</button>`
+          : "";
+        return `<tr>
+          <td>${escapeHtml(item.session_id.slice(0, 8))}…</td>
+          <td>${escapeHtml(item.subject_ref)}</td>
+          <td>${escapeHtml(item.sector)}:${escapeHtml(item.action)}</td>
+          <td><span class="pill warn">${escapeHtml(item.outcome)}</span></td>
+          <td>${escapeHtml((item.reason_codes || []).join(", "))}</td>
+          <td><div class="btn-row">
+            <button type="button" class="btn btn-primary btn-sm" onclick="submitAdminReview('${sid}', 'APPROVED')">Approve</button>
+            <button type="button" class="btn btn-danger btn-sm" onclick="submitAdminReview('${sid}', 'REJECTED')">Reject</button>
+            ${stepUpBtn}
+          </div></td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function submitAdminReview(sessionId, decision) {
+      const reason = (document.getElementById("review-reason-input")?.value || "").trim();
+      if (reason.length < 3) {
+        setStatus("review-queue-status", "Enter a review reason (min 3 characters) before approving or rejecting.", "err");
+        return;
+      }
+      try {
+        const res = await apiJson(`/api/v1/decisions/${encodeURIComponent(sessionId)}/review`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, reason })
+        });
+        setStatus("review-queue-status", `Reviewed ${sessionId.slice(0, 8)} -> ${res.outcome} at ${res.reviewed_at} (${res.reason})`, res.outcome === "APPROVED" ? "ok" : "err");
+        await refreshAdminPanels();
+      } catch (err) {
+        setStatus("review-queue-status", err.message, "err");
+      }
+    }
+
+    async function completeStepUpFromQueue(sessionId, method) {
+      try {
+        const res = await apiJson(`/api/v1/decisions/${encodeURIComponent(sessionId)}/step-up/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ method })
+        });
+        setStatus("review-queue-status", `Simulated ${method}: ${sessionId.slice(0, 8)} -> ${res.outcome}`, res.outcome === "APPROVED" ? "ok" : "warn");
+        await refreshAdminPanels();
+      } catch (err) {
+        setStatus("review-queue-status", err.message, "err");
+      }
     }
 
     function updateDemoHelperUi() {

@@ -15,6 +15,26 @@ from app.auth import is_demo_mode, is_weak_secret
 
 _EPHEMERAL_DEMO_WEBHOOK_SECRET = secrets.token_urlsafe(32)
 
+CANONICAL_OUTCOMES = ("APPROVED", "STEP-UP", "REVIEW / HOLD", "REJECTED")
+
+NON_VOICE_FALLBACK_OPTIONS: list[dict[str, Any]] = [
+    {
+        "method": "trusted_app_push",
+        "label": "Trusted App Push Approval",
+        "simulated": True,
+    },
+    {
+        "method": "in_store_kyc",
+        "label": "In-Store Biometric KYC",
+        "simulated": True,
+    },
+    {
+        "method": "manager_callback",
+        "label": "Verified Manager Callback",
+        "simulated": True,
+    },
+]
+
 GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
     "telecom": {
         "name": "telecom",
@@ -308,11 +328,12 @@ def evaluate_voice_authorization(
         )
         reason_code = "AUDIO_QUALITY_LOW" if is_short_audio else "PROVIDER_UNAVAILABLE"
         return AuthorizationDecision(
-            outcome="REJECTED",
+            outcome="REVIEW / HOLD",
             evidence_state="INCONCLUSIVE_EVIDENCE",
             reason_codes=[reason_code],
             next_step_script=(
-                "Request cancelled: automated voice evidence could not be completed reliably (fail-closed)."
+                "Audio evidence could not be verified reliably. Genuine users are never auto-cancelled — "
+                "complete a Non-Voice Accessibility Fallback: Trusted App Push, In-Store Biometric KYC, or Verified Manager Callback."
             ),
             emit_risk_alert=False,
         )
@@ -396,24 +417,13 @@ def evaluate_voice_authorization(
     ):
         step_up_reasons.append("HIGH_VALUE_STEP_UP")
 
-    if has_cross_domain_alert:
-        return AuthorizationDecision(
-            outcome="REJECTED",
-            evidence_state="ACOUSTIC_PASS",
-            reason_codes=step_up_reasons,
-            next_step_script=(
-                "Request cancelled: an active cross-domain SIM swap alert blocks this subject."
-            ),
-            emit_risk_alert=False,
-        )
-
     if step_up_reasons:
         return AuthorizationDecision(
             outcome="STEP-UP",
             evidence_state="ACOUSTIC_PASS",
             reason_codes=step_up_reasons,
             next_step_script=(
-                "Voice matched, and contextual policy controls require a secondary step-up approval before proceeding."
+                "Voice matched, and contextual or cross-domain risk signals require out-of-band step-up confirmation before proceeding."
             ),
             emit_risk_alert=False,
         )

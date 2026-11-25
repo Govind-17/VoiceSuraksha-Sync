@@ -446,7 +446,7 @@ def test_cross_domain_sim_swap_alert_holds_banking(make_test_client):
     risks = client.get("/api/v1/risk-events").json()["risk_events"]
     assert any(r["subject_ref"] == "SUB-301" and r["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED" for r in risks)
 
-    # 2. Subsequent banking action with matching voice is HELD due to active cross-domain alert
+    # 2. Subsequent banking action with matching voice becomes STEP-UP (CROSS_DOMAIN_ALERT), not REJECTED
     call_mode["fake"] = False
     bank_sess = client.post(
         "/api/v1/verification-sessions",
@@ -463,10 +463,11 @@ def test_cross_domain_sim_swap_alert_holds_banking(make_test_client):
         data={"spoken_transcript": bank_sess["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert bank_res["outcome"] == "REJECTED"
-    assert bank_res["status"] == "CANCELLED"
+    assert bank_res["outcome"] == "STEP-UP"
+    assert bank_res["status"] == "STEP_UP"
     assert "CROSS_DOMAIN_ALERT" in bank_res["reason_codes"]
     assert bank_res["decision_token"] is None
+    assert len(bank_res["fallback_options"]) == 3
 
 
 def test_provider_timeout_and_403_fail_closed(make_test_client):
@@ -487,7 +488,7 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
     client = make_test_client(handler)
     _enroll_subject(client, "SUB-401")
 
-    # Timeout case -> fail closed REJECTED (CANCELLED)
+    # Timeout case -> fail closed REVIEW / HOLD with non-voice fallbacks
     sess1 = client.post(
         "/api/v1/verification-sessions",
         json={
@@ -502,13 +503,14 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
         data={"spoken_transcript": sess1["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert res1["outcome"] == "REJECTED"
-    assert res1["status"] == "CANCELLED"
+    assert res1["outcome"] == "REVIEW / HOLD"
+    assert res1["status"] == "HOLD"
     assert res1["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert res1["reason_codes"] == ["PROVIDER_UNAVAILABLE"]
     assert res1["decision_token"] is None
+    assert {opt["method"] for opt in res1["fallback_options"]} == {"trusted_app_push", "in_store_kyc", "manager_callback"}
 
-    # 403 insufficient_scope case -> fail closed REJECTED (CANCELLED)
+    # 403 insufficient_scope case -> fail closed REVIEW / HOLD with non-voice fallbacks
     mode["behavior"] = "403"
     sess2 = client.post(
         "/api/v1/verification-sessions",
@@ -524,11 +526,12 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
         data={"spoken_transcript": sess2["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert res2["outcome"] == "REJECTED"
-    assert res2["status"] == "CANCELLED"
+    assert res2["outcome"] == "REVIEW / HOLD"
+    assert res2["status"] == "HOLD"
     assert res2["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert res2["reason_codes"] == ["PROVIDER_UNAVAILABLE"]
     assert res2["decision_token"] is None
+    assert len(res2["fallback_options"]) == 3
 
 
 def test_contextual_step_ups_and_protective_low_friction(make_test_client):
@@ -580,7 +583,7 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
     assert emerg_res["outcome"] == "APPROVED"
     assert emerg_res["decision_token"] is not None
 
-    # Short <4s clip -> INCONCLUSIVE_EVIDENCE (REJECTED & CANCELLED)
+    # Short <4s clip -> INCONCLUSIVE_EVIDENCE (REVIEW / HOLD with non-voice fallbacks)
     short_sess = client.post(
         "/api/v1/verification-sessions",
         json={
@@ -595,10 +598,11 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
         data={"spoken_transcript": short_sess["challenge_text"]},
         files={"file": ("short.wav", make_pcm_wav_bytes(2.5), "audio/wav")},
     ).json()
-    assert short_res["outcome"] == "REJECTED"
-    assert short_res["status"] == "CANCELLED"
+    assert short_res["outcome"] == "REVIEW / HOLD"
+    assert short_res["status"] == "HOLD"
     assert short_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert short_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
+    assert len(short_res["fallback_options"]) == 3
 
 
 def test_clear_demo_alerts_keeps_enrollments_intact(make_test_client):
@@ -978,7 +982,7 @@ def test_metrics_and_audit_dossier_export(make_test_client):
     assert len(dossier_after["audit_events"]) == 2
     assert client.get("/api/v1/audit/missing-session/export").status_code == 404
 
-    # Trigger a blocked verification (<4s fails closed with REJECTED)
+    # Trigger a blocked verification (wrong phrase -> REJECTED) + a held verification (<4s -> REVIEW / HOLD)
     sess_bad = client.post(
         "/api/v1/verification-sessions",
         json={
@@ -988,17 +992,36 @@ def test_metrics_and_audit_dossier_export(make_test_client):
             "resource_ref": "TKT-901",
         },
     ).json()
+    client._asr_cfg["transcript"] = "wrong phrase for reject metric"
     bad_res = client.post(
         f"/api/v1/verification-sessions/{sess_bad['session_id']}/audio",
         data={"spoken_transcript": ""},
-        files={"file": ("short.wav", make_pcm_wav_bytes(2.0), "audio/wav")},
+        files={"file": ("wrong.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
+    client._asr_cfg["transcript"] = None
     assert bad_res["outcome"] == "REJECTED"
 
+    sess_hold = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "helpdesk",
+            "subject_ref": "SUB-901",
+            "action": "mfa_reset",
+            "resource_ref": "TKT-902",
+        },
+    ).json()
+    hold_res = client.post(
+        f"/api/v1/verification-sessions/{sess_hold['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("short.wav", make_pcm_wav_bytes(2.0), "audio/wav")},
+    ).json()
+    assert hold_res["outcome"] == "REVIEW / HOLD"
+
     metrics = client.get("/api/v1/metrics").json()
-    assert metrics["total_verifications"] == 2
+    assert metrics["total_verifications"] == 3
     assert metrics["pass_count"] == 1
     assert metrics["blocked_count"] == 1
+    assert metrics["hold_count"] == 1
     assert metrics["p50_latency_ms"] == round(float(VERIFY_FIXTURE["latency_ms"]), 1)
     assert metrics["last_credits_balance"] == VERIFY_FIXTURE["credits"]["balance"]
 
@@ -1012,8 +1035,8 @@ def test_redteam_sandbox_all_five_scenarios_and_clear_alerts(make_test_client):
         "token_replay": (409, "REJECTED", "TOKEN_REPLAY_BLOCKED"),
         "action_substitution": (409, "REJECTED", "ACTION_SUBSTITUTION_BLOCKED"),
         "expired_challenge": (410, "REJECTED", "CHALLENGE_EXPIRED"),
-        "provider_outage_fail_closed": (503, "REJECTED", "PROVIDER_UNAVAILABLE"),
-        "cross_domain_sim_alert": (403, "REJECTED", "CROSS_DOMAIN_ALERT"),
+        "provider_outage_fail_closed": (503, "REVIEW / HOLD", "PROVIDER_UNAVAILABLE"),
+        "cross_domain_sim_alert": (200, "STEP-UP", "CROSS_DOMAIN_ALERT"),
     }
 
     for scenario, (exp_http, exp_outcome, exp_reason) in expected.items():
@@ -1084,7 +1107,7 @@ def test_audio_replay_detected_even_when_transcript_matches(make_test_client):
         data={"spoken_transcript": sess2["challenge_text"]},
         files={"file": ("replay.wav", reused_wav, "audio/wav")},
     ).json()
-    assert res2["outcome"] == "REJECT_REQUEST"
+    assert res2["outcome"] == "REJECTED"
     assert res2["status"] == "CANCELLED"
     assert res2["evidence_state"] == "REPLAY_DETECTED"
     assert res2["reason_codes"] == ["AUDIO_REPLAY_DETECTED"]
@@ -1406,3 +1429,360 @@ def test_live_mode_refuses_startup_on_default_or_short_secrets(monkeypatch, tmp_
         assert row.version == CURRENT_SCHEMA_VERSION
     assert is_storage_durable(f"sqlite:///{db_file}") is False
     eng.dispose()
+
+
+def test_step_up_completion_single_token_double_complete_409_and_banking_threshold(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    # Normal user registers with voiceprint
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "bank.stepup.user",
+            "display_name": "Bank StepUp User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "BANK-REG-1",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reg.status_code == 200
+    sub = reg.json()["user"]["subject_ref"]
+
+    # User creates Banking card_replacement without admin amount -> STEP-UP (AMOUNT_REQUIRED)
+    bk_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "banking",
+            "subject_ref": sub,
+            "action": "card_replacement",
+            "resource_ref": "CARD-SU-1",
+        },
+    ).json()
+    bk_res = client.post(
+        f"/api/v1/verification-sessions/{bk_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert bk_res["outcome"] == "STEP-UP"
+    assert "AMOUNT_REQUIRED" in bk_res["reason_codes"]
+    assert "decision_token" not in bk_res
+
+    # Non-admin user cannot supply amount_inr during step-up/complete
+    user_attempt = client.post(
+        f"/api/v1/decisions/{bk_sess['session_id']}/step-up/complete",
+        json={"method": "trusted_app_push", "amount_inr": 1000},
+    )
+    assert user_attempt.status_code == 403
+
+    # Admin logs in and supplies amount_inr=250000 via trusted_app_push -> re-evaluates high-value threshold (>= 100k)
+    from app.auth import get_admin_credentials
+
+    admin_u, admin_p = get_admin_credentials()
+    client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+    high_push = client.post(
+        f"/api/v1/decisions/{bk_sess['session_id']}/step-up/complete",
+        json={"method": "trusted_app_push", "amount_inr": 250000},
+    )
+    assert high_push.status_code == 200
+    hp = high_push.json()
+    assert hp["outcome"] == "STEP-UP"
+    assert "HIGH_VALUE_STEP_UP" in hp["reason_codes"]
+    assert hp["threshold_evaluation"]["high_value"] is True
+    assert hp["decision_token"] is None
+
+    # Admin completes via manager_callback (simulated) -> APPROVED + exactly ONE token issued
+    done = client.post(
+        f"/api/v1/decisions/{bk_sess['session_id']}/step-up/complete",
+        json={"method": "manager_callback", "amount_inr": 250000},
+    )
+    assert done.status_code == 200
+    done_body = done.json()
+    assert done_body["outcome"] == "APPROVED"
+    assert done_body["simulated"] is True
+    assert "STEP_UP_COMPLETED" in done_body["reason_codes"]
+    assert "HIGH_VALUE_THRESHOLD_VERIFIED" in done_body["reason_codes"]
+    token = done_body["decision_token"]
+    assert token
+
+    # Double completion MUST fail with 409
+    double_done = client.post(
+        f"/api/v1/decisions/{bk_sess['session_id']}/step-up/complete",
+        json={"method": "in_store_kyc", "amount_inr": 250000},
+    )
+    assert double_done.status_code == 409
+
+    # Audit log contains STEP_UP_COMPLETED and single-use token consumes once (409 on replay)
+    audits = client.get("/api/v1/audit").json()["audit_events"]
+    assert any("STEP_UP_COMPLETED" in a["reason_codes"] for a in audits if a["session_id"] == bk_sess["session_id"])
+    assert (
+        client.post(
+            f"/api/v1/decisions/{bk_sess['session_id']}/consume",
+            json={"decision_token": token, "action": "card_replacement", "resource_ref": "CARD-SU-1"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/api/v1/decisions/{bk_sess['session_id']}/consume",
+            json={"decision_token": token, "action": "card_replacement", "resource_ref": "CARD-SU-1"},
+        ).status_code
+        == 409
+    )
+
+
+def test_admin_reviewer_queue_approve_and_reject_with_reason(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-REV-1")
+
+    # 1. Put a session into HOLD via silent audio
+    hold_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-REV-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-REV-1",
+        },
+    ).json()
+    hold_res = client.post(
+        f"/api/v1/verification-sessions/{hold_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("silent.wav", make_pcm_wav_bytes(6.0, silent=True), "audio/wav")},
+    ).json()
+    assert hold_res["outcome"] == "REVIEW / HOLD"
+
+    # 2. Put a second session into STEP-UP via privileged role
+    client.patch("/api/v1/admin/subjects/SUB-REV-1/privilege", json={"privileged_role": True})
+    su_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "helpdesk",
+            "subject_ref": "SUB-REV-1",
+            "action": "mfa_reset",
+            "resource_ref": "TKT-REV-2",
+        },
+    ).json()
+    su_res = client.post(
+        f"/api/v1/verification-sessions/{su_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ok.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert su_res["outcome"] == "STEP-UP"
+
+    queue = client.get("/api/v1/admin/review-queue").json()["review_queue"]
+    queued_ids = {q["session_id"] for q in queue}
+    assert {hold_sess["session_id"], su_sess["session_id"]}.issubset(queued_ids)
+
+    # Empty/whitespace reason is rejected
+    bad_rev = client.post(
+        f"/api/v1/decisions/{hold_sess['session_id']}/review",
+        json={"decision": "APPROVED", "reason": "  "},
+    )
+    assert bad_rev.status_code in {400, 422}
+
+    # Approve HOLD session -> issues token + logs REVIEWER_APPROVED + timestamp
+    app_rev = client.post(
+        f"/api/v1/decisions/{hold_sess['session_id']}/review",
+        json={"decision": "APPROVED", "reason": "Verified customer over callback"},
+    )
+    assert app_rev.status_code == 200
+    app_body = app_rev.json()
+    assert app_body["outcome"] == "APPROVED"
+    assert app_body["decision_token"]
+    assert app_body["reviewed_at"]
+    assert (
+        client.post(
+            f"/api/v1/decisions/{hold_sess['session_id']}/review",
+            json={"decision": "REJECTED", "reason": "Duplicate review"},
+        ).status_code
+        == 409
+    )
+
+    # Reject STEP-UP session -> CANCELLED, no token
+    rej_rev = client.post(
+        f"/api/v1/decisions/{su_sess['session_id']}/review",
+        json={"decision": "REJECTED", "reason": "Manager denied privileged reset"},
+    )
+    assert rej_rev.status_code == 200
+    rej_body = rej_rev.json()
+    assert rej_body["outcome"] == "REJECTED"
+    assert rej_body["status"] == "CANCELLED"
+    assert rej_body["decision_token"] is None
+
+
+def test_cross_domain_alert_ttl_and_resolve_alert(make_test_client, db_session_factory):
+    fake_verify = copy.deepcopy(VERIFY_FIXTURE)
+    fake_verify["deepfake"]["verdict"] = "fake"
+    fake_verify["deepfake"]["is_synthetic"] = True
+    mode = {"fake": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(fake_verify if mode["fake"] else VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-ALERT-1")
+
+    # Emit SIM_SWAP_ATTEMPT_BLOCKED
+    tel = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-ALERT-1", "action": "sim_replacement", "resource_ref": "SIM-A1"},
+    ).json()
+    tel_res = client.post(
+        f"/api/v1/verification-sessions/{tel['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("clone.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    alert_id = tel_res["emitted_risk_event"]["id"]
+
+    # emergency_sim_block remains low-friction APPROVED even while alert is ACTIVE
+    mode["fake"] = False
+    emerg = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-ALERT-1", "action": "emergency_sim_block", "resource_ref": "SIM-E1"},
+    ).json()
+    emerg_res = client.post(
+        f"/api/v1/verification-sessions/{emerg['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("emerg.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert emerg_res["outcome"] == "APPROVED"
+
+    # Admin resolves the alert -> subsequent banking request passes APPROVED cleanly
+    resolved = client.post(f"/api/v1/risk-events/{alert_id}/resolve", json={"resolution_note": "Owner confirmed"})
+    assert resolved.status_code == 200
+    assert resolved.json()["risk_state"] == "RESOLVED"
+    assert client.post(f"/api/v1/risk-events/{alert_id}/resolve").status_code == 409
+    assert client.post("/api/v1/risk-events/99999/resolve").status_code == 404
+
+    bank_ok = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "banking",
+            "subject_ref": "SUB-ALERT-1",
+            "action": "card_replacement",
+            "resource_ref": "CARD-A1",
+            "amount_inr": 50000,
+        },
+    ).json()
+    assert (
+        client.post(
+            f"/api/v1/verification-sessions/{bank_ok['session_id']}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": ("ok2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+        ).json()["outcome"]
+        == "APPROVED"
+    )
+
+    # Alert TTL expiry also prevents blocking once expires_at <= now
+    from app.models import RiskEvent
+
+    mode["fake"] = True
+    tel2 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-ALERT-1", "action": "sim_replacement", "resource_ref": "SIM-A2"},
+    ).json()
+    tel2_res = client.post(
+        f"/api/v1/verification-sessions/{tel2['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("clone2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    alert2_id = tel2_res["emitted_risk_event"]["id"]
+
+    with db_session_factory() as db:
+        row = db.query(RiskEvent).filter_by(id=alert2_id).one()
+        row.expires_at = utcnow() - timedelta(minutes=1)
+        db.commit()
+
+    risks_list = client.get("/api/v1/risk-events").json()["risk_events"]
+    assert any(r["id"] == alert2_id and r["expired"] is True for r in risks_list)
+
+    mode["fake"] = False
+    bank_ttl = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "banking",
+            "subject_ref": "SUB-ALERT-1",
+            "action": "card_replacement",
+            "resource_ref": "CARD-A2",
+            "amount_inr": 50000,
+        },
+    ).json()
+    assert (
+        client.post(
+            f"/api/v1/verification-sessions/{bank_ttl['session_id']}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": ("ok3.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+        ).json()["outcome"]
+        == "APPROVED"
+    )
+
+
+def test_every_hold_cause_returns_fallbacks_and_asr_down_still_rejects_fake(make_test_client):
+    fake_verify = copy.deepcopy(VERIFY_FIXTURE)
+    fake_verify["deepfake"]["verdict"] = "fake"
+    fake_verify["deepfake"]["is_synthetic"] = True
+    mode = {"fake": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(fake_verify if mode["fake"] else VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-HOLD-ALL")
+
+    # ASR_UNAVAILABLE with passing voice -> REVIEW / HOLD + 3 fallback options
+    client._asr_cfg["available"] = False
+    s_asr = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-HOLD-ALL", "action": "sim_replacement", "resource_ref": "SIM-H1"},
+    ).json()
+    r_asr = client.post(
+        f"/api/v1/verification-sessions/{s_asr['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v_ok.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r_asr["outcome"] == "REVIEW / HOLD"
+    assert r_asr["reason_codes"] == ["ASR_UNAVAILABLE"]
+    assert {opt["method"] for opt in r_asr["fallback_options"]} == {"trusted_app_push", "in_store_kyc", "manager_callback"}
+
+    # Even with ASR_UNAVAILABLE, fake audio MUST still REJECTED immediately
+    mode["fake"] = True
+    s_fake = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-HOLD-ALL", "action": "sim_replacement", "resource_ref": "SIM-H2"},
+    ).json()
+    r_fake = client.post(
+        f"/api/v1/verification-sessions/{s_fake['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v_fake.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r_fake["outcome"] == "REJECTED"
+    assert "DEEPFAKE_SIGNAL" in r_fake["reason_codes"]
+    assert r_fake["fallback_options"] == []
+
+    # Silent and clipped HOLD responses also carry all 3 non-voice fallbacks
+    client._asr_cfg["available"] = True
+    mode["fake"] = False
+    for bad_wav in (make_pcm_wav_bytes(6.0, silent=True), make_pcm_wav_bytes(6.0, clipped=True)):
+        s_q = client.post(
+            "/api/v1/verification-sessions",
+            json={"sector": "helpdesk", "subject_ref": "SUB-HOLD-ALL", "action": "mfa_reset", "resource_ref": "TKT-H1"},
+        ).json()
+        r_q = client.post(
+            f"/api/v1/verification-sessions/{s_q['session_id']}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": ("bad.wav", bad_wav, "audio/wav")},
+        ).json()
+        assert r_q["outcome"] == "REVIEW / HOLD"
+        assert r_q["reason_codes"] == ["AUDIO_QUALITY_LOW"]
+        assert len(r_q["fallback_options"]) == 3
