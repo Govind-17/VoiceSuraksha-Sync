@@ -7,8 +7,12 @@ import hashlib
 import io
 import json
 import math
+import os
+import secrets
 import struct
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
@@ -20,7 +24,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.asr import ServerASRAdapter, ServerASRResult
 from app.audio_fingerprint import MAX_PERCEPTUAL_HAMMING_BITS, compute_perceptual_hash, hamming_distance_hex
-from app.auth import validate_live_secrets
+from app.auth import PBKDF2_ITERATIONS, hash_password, validate_live_secrets, verify_password
 from app.db import Base, CURRENT_SCHEMA_VERSION, create_db_engine, get_database_url, get_storage_backend, init_db, is_storage_durable
 from app.detectif_client import DetectifClient
 from app.main import _is_ist_after_hours, app, get_asr_adapter, get_db, get_detectif_client
@@ -133,7 +137,8 @@ def make_test_client(db_session_factory, monkeypatch):
         app.dependency_overrides[get_db] = _override_get_db
         app.dependency_overrides[get_detectif_client] = lambda: make_mock_client(mock_handler)
         app.dependency_overrides[get_asr_adapter] = lambda: _TestASRAdapter()
-        client = TestClient(app)
+        base_url = "http://testserver" if demo_mode else "https://testserver"
+        client = TestClient(app, base_url=base_url)
         client._asr_cfg = asr_cfg  # type: ignore[attr-defined]
         if auto_login_admin:
             from app.auth import get_admin_credentials
@@ -2206,3 +2211,197 @@ def test_tamper_evident_audit_hash_chain_and_detection(make_test_client, db_sess
     assert broken["valid"] is False
     assert broken["first_broken_index"] == 0
     assert broken["first_broken_id"] is not None
+
+
+def test_auth_hardening_pbkdf2_600k_legacy_compat_cookies_non_ascii_and_headers(make_test_client, monkeypatch):
+    # 1) New password hashes use 600,000 iterations encoded in the 4-part hash string
+    hashed = hash_password("StrongPass-2026!")
+    parts = hashed.split("$")
+    assert len(parts) == 4
+    assert parts[0] == "pbkdf2_sha256"
+    assert int(parts[1]) == PBKDF2_ITERATIONS == 600_000
+    assert verify_password("StrongPass-2026!", hashed) is True
+    assert verify_password("wrong", hashed) is False
+
+    # 2) Legacy 3-part 120,000-iteration hashes continue to verify
+    legacy_salt = secrets.token_bytes(16)
+    legacy_digest = hashlib.pbkdf2_hmac("sha256", b"legacy-pw-123", legacy_salt, 120_000)
+    legacy_hash = f"pbkdf2_sha256${legacy_salt.hex()}${legacy_digest.hex()}"
+    assert verify_password("legacy-pw-123", legacy_hash) is True
+    assert verify_password("not-legacy", legacy_hash) is False
+
+    # 3) Security headers & Secure cookie enforcement in LIVE mode + non-ASCII compare_digest safety
+    handler, _ = _default_fixture_handler()
+    live_client = make_test_client(handler, auto_login_admin=False, demo_mode=False)
+
+    ui_resp = live_client.get("/")
+    assert ui_resp.status_code == 200
+    assert ui_resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert ui_resp.headers.get("X-Frame-Options") == "DENY"
+    assert ui_resp.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
+    csp = ui_resp.headers.get("Content-Security-Policy", "")
+    assert "default-src 'self'" in csp and "frame-ancestors 'none'" in csp
+
+    non_ascii = live_client.post(
+        "/api/v1/auth/login",
+        json={"username": "adm\u00edn-\u0915", "password": "p\u00e4ssword-\u0c95"},
+    )
+    assert non_ascii.status_code == 401
+
+    from app.auth import get_admin_credentials
+
+    admin_u, admin_p = get_admin_credentials()
+    live_login = live_client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+    assert live_login.status_code == 200
+    live_cookie = live_login.headers.get("set-cookie", "")
+    assert "; Secure" in live_cookie or "; secure" in live_cookie.lower()
+
+    # Demo mode keeps cookies usable over plain localhost HTTP (no Secure flag)
+    demo_client = make_test_client(handler, auto_login_admin=False, demo_mode=True)
+    demo_u, demo_p = get_admin_credentials()
+    demo_login = demo_client.post("/api/v1/auth/login", json={"username": demo_u, "password": demo_p})
+    assert demo_login.status_code == 200
+    assert "secure" not in demo_login.headers.get("set-cookie", "").lower()
+
+
+def test_atomic_decision_token_double_consume_race_returns_single_success(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-RACE-1")
+
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-RACE-1", "action": "sim_replacement", "resource_ref": "SIM-R1"},
+    ).json()
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("race.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert res["outcome"] == "APPROVED"
+    token = res["decision_token"]
+    sid = sess["session_id"]
+    admin_cookie = dict(client.cookies)
+
+    n_workers = 6
+    barrier = threading.Barrier(n_workers)
+
+    def _worker() -> int:
+        tc = TestClient(app, base_url="https://testserver")
+        try:
+            for k, v in admin_cookie.items():
+                tc.cookies.set(k, v)
+            barrier.wait(timeout=5)
+            r = tc.post(
+                f"/api/v1/decisions/{sid}/consume",
+                json={"decision_token": token, "action": "sim_replacement", "resource_ref": "SIM-R1"},
+            )
+            return r.status_code
+        finally:
+            tc.close()
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        statuses = list(pool.map(lambda _i: _worker(), range(n_workers)))
+
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_workers - 1
+
+
+def test_contextual_risk_signals_sim_age_device_change_and_call_velocity(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    profiles = client.get("/api/v1/profiles").json()["profiles"]
+    assert profiles["telecom"]["contextual_rules"]["sim_age_days"]["reason_code"] == "RECENT_SIM_SWAP"
+    assert profiles["telecom"]["contextual_rules"]["call_velocity_1h"]["hold_reason_code"] == "CALL_VELOCITY_HOLD"
+
+    _enroll_subject(client, "SUB-CTX-RISK")
+
+    # 1) Recent SIM swap (sim_age_days < 7) -> STEP-UP RECENT_SIM_SWAP
+    s1 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-CTX-RISK",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-C1",
+            "sim_age_days": 2,
+        },
+    )
+    assert s1.status_code == 200
+    assert s1.json()["contextual_risk_signals"]["sim_age_simulated"] is True
+    r1 = client.post(
+        f"/api/v1/verification-sessions/{s1.json()['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ctx1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r1["outcome"] == "STEP-UP"
+    assert "RECENT_SIM_SWAP" in r1["reason_codes"]
+
+    # 2) Device change flag -> STEP-UP DEVICE_CHANGED
+    s2 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-CTX-RISK",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-C2",
+            "device_changed": True,
+        },
+    ).json()
+    r2 = client.post(
+        f"/api/v1/verification-sessions/{s2['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ctx2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r2["outcome"] == "STEP-UP"
+    assert "DEVICE_CHANGED" in r2["reason_codes"]
+
+    # 3) High 1-hour call velocity: session #6 -> STEP-UP (HIGH_CALL_VELOCITY), session #8 -> REVIEW / HOLD
+    for idx in range(3, 6):
+        client.post(
+            "/api/v1/verification-sessions",
+            json={"sector": "telecom", "subject_ref": "SUB-CTX-RISK", "action": "sim_replacement", "resource_ref": f"SIM-V{idx}"},
+        )
+    s6 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-CTX-RISK", "action": "sim_replacement", "resource_ref": "SIM-V6"},
+    ).json()
+    assert s6["contextual_risk_signals"]["call_velocity_1h"] == 6
+    r6 = client.post(
+        f"/api/v1/verification-sessions/{s6['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ctx6.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r6["outcome"] == "STEP-UP"
+    assert "HIGH_CALL_VELOCITY" in r6["reason_codes"]
+
+    client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-CTX-RISK", "action": "sim_replacement", "resource_ref": "SIM-V7"},
+    )
+    s8 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-CTX-RISK", "action": "sim_replacement", "resource_ref": "SIM-V8"},
+    ).json()
+    assert s8["contextual_risk_signals"]["call_velocity_1h"] == 8
+    r8 = client.post(
+        f"/api/v1/verification-sessions/{s8['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ctx8.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r8["outcome"] == "REVIEW / HOLD"
+    assert r8["reason_codes"] == ["CALL_VELOCITY_HOLD"]
+    assert len(r8["fallback_options"]) == 3
+
+    # Protective emergency_sim_block remains low-friction even under high call velocity
+    s9 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-CTX-RISK", "action": "emergency_sim_block", "resource_ref": "SIM-EMG9"},
+    ).json()
+    r9 = client.post(
+        f"/api/v1/verification-sessions/{s9['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ctx9.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r9["outcome"] == "APPROVED"

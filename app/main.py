@@ -24,7 +24,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Respon
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.asr import ServerASRAdapter
@@ -47,6 +47,7 @@ from app.auth import (
     require_admin,
     set_session_cookie,
     validate_live_secrets,
+    verify_admin_credentials,
     verify_password,
 )
 from app.db import get_db, get_storage_backend, init_db, is_storage_durable
@@ -109,6 +110,31 @@ def _is_subject_privileged(db: Session, subject_ref: str, enrollment: Enrollment
     enr = enrollment or db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
     acct = db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref))
     return bool((enr and enr.privileged_role) or (acct and acct.privileged_role))
+
+
+def _compute_call_velocity_1h(db: Session, subject_ref: str, now_utc: datetime) -> int:
+    """Compute server-side 1-hour session count for a subject including the upcoming session."""
+    cutoff_exp = _as_utc(now_utc) + timedelta(minutes=SESSION_TTL_MINUTES) - timedelta(hours=1)
+    prior_count = db.scalar(
+        select(func.count(VerificationSession.session_id)).where(
+            VerificationSession.subject_ref == subject_ref,
+            VerificationSession.expires_at > cutoff_exp,
+        )
+    )
+    return int(prior_count or 0) + 1
+
+
+def _contextual_signals_dict(session: VerificationSession, now_utc: datetime) -> dict[str, Any]:
+    """Serialize contextual risk signals attached to a session (with simulated labels preserved)."""
+    return {
+        "sim_age_days": session.sim_age_days,
+        "sim_age_simulated": True,
+        "device_changed": bool(session.device_changed),
+        "device_changed_simulated": True,
+        "call_velocity_1h": int(session.call_velocity_1h),
+        "after_hours": bool(session.after_hours),
+        "time_of_day_ist": _as_utc(now_utc).astimezone(IST_ZONE).strftime("%H:%M IST"),
+    }
 
 
 def _client_ip(request: Request) -> str:
@@ -277,6 +303,30 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Attach baseline browser security headers compatible with the single-file SOC UI."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' blob: data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'",
+    )
+    return response
+
+
 class CreateSessionRequest(BaseModel):
     sector: str
     subject_ref: str = Field(..., min_length=2, max_length=64)
@@ -285,6 +335,8 @@ class CreateSessionRequest(BaseModel):
     after_hours: bool = False
     privileged_role: bool = False
     amount_inr: float | None = None
+    sim_age_days: int | None = Field(default=None, ge=0, le=3650)
+    device_changed: bool = False
 
 
 class ConsumeDecisionRequest(BaseModel):
@@ -577,8 +629,8 @@ def auth_login(
     except RateLimitExceeded as exc:
         _raise_rate_limited(db, exc=exc, session_id=f"auth-{ip}", sector="auth", action="login")
 
-    admin_user, admin_pass = get_admin_credentials()
-    if clean_username == admin_user and secrets.compare_digest(body.password.encode("utf-8"), admin_pass.encode("utf-8")):
+    admin_user, _ = get_admin_credentials()
+    if verify_admin_credentials(clean_username, body.password):
         gateway_rate_limiter.clear_login_failures(db, ip=ip, username=clean_username)
         db.commit()
         actor = AuthActor(
@@ -1105,6 +1157,7 @@ def create_verification_session(
     challenge_text = generate_challenge_phrase(body.sector, body.action, body.resource_ref)
     challenge_hash = hash_text_sha256(normalize_transcript(challenge_text))
     expires_at = now + timedelta(minutes=SESSION_TTL_MINUTES)
+    call_velocity_1h = _compute_call_velocity_1h(db, body.subject_ref, now)
 
     session = VerificationSession(
         session_id=session_id,
@@ -1119,6 +1172,9 @@ def create_verification_session(
         after_hours=_is_ist_after_hours(now),
         privileged_role=_is_subject_privileged(db, body.subject_ref, enrollment),
         amount_inr=body.amount_inr if actor.role == "admin" else None,
+        sim_age_days=body.sim_age_days,
+        device_changed=bool(body.device_changed),
+        call_velocity_1h=call_velocity_1h,
     )
     db.add(session)
     db.commit()
@@ -1134,6 +1190,7 @@ def create_verification_session(
         "challenge_hash": session.challenge_hash,
         "expires_at": _as_utc(session.expires_at).isoformat(),
         "status": session.status,
+        "contextual_risk_signals": _contextual_signals_dict(session, now),
     }
 
 
@@ -1371,6 +1428,9 @@ async def submit_verification_audio(
             asr_available=asr_available,
             challenge_attempt=session.challenge_attempt,
             new_enrollment_cooldown=in_reenroll_cooldown,
+            sim_age_days=session.sim_age_days,
+            device_changed=bool(session.device_changed),
+            call_velocity_1h=int(session.call_velocity_1h),
         )
         evaluation = evaluate_voice_authorization(
             session=policy_session,
@@ -1454,6 +1514,9 @@ async def submit_verification_audio(
             after_hours=session.after_hours,
             privileged_role=session.privileged_role,
             amount_inr=session.amount_inr,
+            sim_age_days=session.sim_age_days,
+            device_changed=bool(session.device_changed),
+            call_velocity_1h=int(session.call_velocity_1h),
             parent_session_id=session.session_id,
             challenge_attempt=session.challenge_attempt + 1,
         )
@@ -1502,6 +1565,8 @@ async def submit_verification_audio(
 
     fallback_options = NON_VOICE_FALLBACK_OPTIONS if evaluation.outcome in {"REVIEW / HOLD", "STEP-UP"} else []
 
+    contextual_payload = _contextual_signals_dict(session, now)
+
     if actor.role != "admin":
         return {
             "session_id": session.session_id,
@@ -1515,6 +1580,7 @@ async def submit_verification_audio(
             "next_step_script": evaluation.next_step_script,
             "fallback_options": fallback_options,
             "audio_quality": quality_payload,
+            "contextual_risk_signals": contextual_payload,
             "voice_summary": {
                 "speaker_decision": voice_row.speaker_decision,
                 "deepfake_verdict": voice_row.deepfake_verdict,
@@ -1534,6 +1600,7 @@ async def submit_verification_audio(
         "next_step_script": evaluation.next_step_script,
         "fallback_options": fallback_options,
         "audio_quality": quality_payload,
+        "contextual_risk_signals": contextual_payload,
         "decision_token": plaintext_token,
         "token_expires_at": token_expires_at.isoformat() if token_expires_at else None,
         "voice_result": {
@@ -1561,7 +1628,7 @@ def consume_decision_token(
     db: Session = Depends(get_db),
     _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Validate and atomically consume a one-time decision token bound to session/action/resource."""
+    """Validate and atomically consume a one-time decision token via a conditional SQL UPDATE."""
     session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
     decision = db.scalar(select(Decision).where(Decision.session_id == session_id))
     if session is None or decision is None:
@@ -1570,13 +1637,6 @@ def consume_decision_token(
     if decision.outcome != "APPROVED" or decision.token_hash is None:
         raise HTTPException(status_code=409, detail=f"Decision outcome '{decision.outcome}' did not issue a consumable token.")
 
-    if decision.consumed_at is not None:
-        raise HTTPException(status_code=409, detail="Decision token has already been consumed.")
-
-    now = utcnow()
-    if decision.expires_at is None or now > _as_utc(decision.expires_at):
-        raise HTTPException(status_code=409, detail="Decision token has expired.")
-
     if session.action != body.action or session.resource_ref != body.resource_ref:
         raise HTTPException(status_code=409, detail="Action or resource_ref does not match the bound verification session.")
 
@@ -1584,12 +1644,39 @@ def consume_decision_token(
     if not secrets.compare_digest(provided_hash, decision.token_hash):
         raise HTTPException(status_code=403, detail="Invalid decision token.")
 
-    decision.consumed_at = now
+    bound_sid = session.session_id
+    bound_sector = session.sector
+    bound_action = session.action
+    bound_resource_ref = session.resource_ref
+    # End the initial read snapshot cleanly so concurrent callers contend on an atomic write statement
+    db.rollback()
+
+    now = utcnow()
+    stmt = (
+        update(Decision)
+        .where(
+            Decision.session_id == bound_sid,
+            Decision.outcome == "APPROVED",
+            Decision.token_hash == provided_hash,
+            Decision.consumed_at.is_(None),
+            Decision.expires_at.is_not(None),
+            Decision.expires_at > now,
+        )
+        .values(consumed_at=now)
+    )
+    res = db.execute(stmt)
+    if (res.rowcount or 0) == 0:
+        db.rollback()
+        latest = db.scalar(select(Decision).where(Decision.session_id == bound_sid))
+        if latest is not None and latest.consumed_at is None and (latest.expires_at is None or now > _as_utc(latest.expires_at)):
+            raise HTTPException(status_code=409, detail="Decision token has expired.")
+        raise HTTPException(status_code=409, detail="Decision token has already been consumed.")
+
     _append_audit_event(
         db,
-        session_id=session.session_id,
-        sector=session.sector,
-        action=session.action,
+        session_id=bound_sid,
+        sector=bound_sector,
+        action=bound_action,
         outcome="APPROVED",
         reason_codes=["TOKEN_CONSUMED", "ACTION_RELEASED"],
         created_at=now,
@@ -1598,10 +1685,10 @@ def consume_decision_token(
 
     return {
         "consumed": True,
-        "session_id": session.session_id,
-        "sector": session.sector,
-        "action": session.action,
-        "resource_ref": session.resource_ref,
+        "session_id": bound_sid,
+        "sector": bound_sector,
+        "action": bound_action,
+        "resource_ref": bound_resource_ref,
         "consumed_at": now.isoformat(),
     }
 
@@ -1917,6 +2004,9 @@ def export_audit_dossier(
             "after_hours": session.after_hours,
             "privileged_role": session.privileged_role,
             "amount_inr": session.amount_inr,
+            "sim_age_days": session.sim_age_days,
+            "device_changed": session.device_changed,
+            "call_velocity_1h": session.call_velocity_1h,
             "challenge_hash": session.challenge_hash,
             "expires_at": _as_utc(session.expires_at).isoformat(),
         },

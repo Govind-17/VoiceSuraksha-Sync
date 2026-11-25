@@ -1615,17 +1615,22 @@
 
     function renderContextControls(sector, profile) {
       const box = document.getElementById("context-control-box");
+      const simExtras = `<div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+        <label class="small" style="margin:0;">SIM Age days (simulated):</label>
+        <input type="number" id="ctx-sim-age" min="0" max="3650" placeholder="e.g. 2" style="width:82px;padding:4px 6px;" />
+        <label class="check-row" style="margin:0;padding:4px 8px;font-size:11.5px;"><input type="checkbox" id="ctx-device-changed" /><span>Device Changed (simulated)</span></label>
+      </div>`;
       if (sector === "telecom") {
-        box.innerHTML = `<label>Telecom Contextual Window</label><label class="check-row" style="margin:0;"><input type="checkbox" id="ctx-after-hours" /><span>After-Hours / Weekend Window</span></label>`;
+        box.innerHTML = `<label>Telecom Contextual Window</label><label class="check-row" style="margin:0;"><input type="checkbox" id="ctx-after-hours" /><span>After-Hours / Weekend Window</span></label>${simExtras}`;
       } else if (sector === "helpdesk") {
-        box.innerHTML = `<label>Helpdesk Role Sensitivity</label><label class="check-row" style="margin:0;"><input type="checkbox" id="ctx-privileged-role" /><span>Privileged Admin / Exec Role</span></label>`;
+        box.innerHTML = `<label>Helpdesk Role Sensitivity</label><label class="check-row" style="margin:0;"><input type="checkbox" id="ctx-privileged-role" /><span>Privileged Admin / Exec Role</span></label>${simExtras}`;
       } else if (sector === "banking") {
         const thresh = profile?.amount_step_up_threshold_inr ?? 100000;
         box.innerHTML = `<label for="ctx-amount-inr">Amount (₹): <strong id="ctx-amount-display" style="color:var(--primary);">₹50,000</strong></label>
           <input type="range" id="ctx-amount-inr" min="10000" max="500000" step="10000" value="50000" oninput="document.getElementById('ctx-amount-display').textContent='₹'+Number(this.value).toLocaleString('en-IN')" />
-          <div class="small" style="margin-top:2px;">Step-up threshold: ₹${Number(thresh).toLocaleString("en-IN")}</div>`;
+          <div class="small" style="margin-top:2px;">Step-up threshold: ₹${Number(thresh).toLocaleString("en-IN")}</div>${simExtras}`;
       } else {
-        box.innerHTML = `<label>Campus Context</label><div class="status-line" style="margin:0;">Standard identity verification preset</div>`;
+        box.innerHTML = `<label>Campus Context</label><div class="status-line" style="margin:0;">Standard identity verification preset</div>${simExtras}`;
       }
     }
 
@@ -1722,6 +1727,9 @@
       const afterHoursEl = document.getElementById("ctx-after-hours");
       const privEl = document.getElementById("ctx-privileged-role");
       const amountEl = document.getElementById("ctx-amount-inr");
+      const simAgeEl = document.getElementById("ctx-sim-age");
+      const devChangedEl = document.getElementById("ctx-device-changed");
+      const simAgeVal = simAgeEl && simAgeEl.value.trim() !== "" ? Number(simAgeEl.value) : null;
       try {
         const sess = await apiJson("/api/v1/verification-sessions", {
           method: "POST",
@@ -1730,7 +1738,9 @@
             sector: state.activeSector, subject_ref: subjectRef, action, resource_ref: resourceRef,
             after_hours: afterHoursEl ? afterHoursEl.checked : false,
             privileged_role: privEl ? privEl.checked : false,
-            amount_inr: amountEl ? Number(amountEl.value) : null
+            amount_inr: amountEl ? Number(amountEl.value) : null,
+            sim_age_days: simAgeVal,
+            device_changed: devChangedEl ? devChangedEl.checked : false
           })
         });
         state.currentSession = sess; state.lastVerification = null; state.tokenConsumed = false;

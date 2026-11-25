@@ -50,6 +50,9 @@ class VerificationSession(Base):
     after_hours: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     privileged_role: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     amount_inr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sim_age_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    device_changed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    call_velocity_1h: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     parent_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     challenge_attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 

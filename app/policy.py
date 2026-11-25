@@ -18,6 +18,35 @@ _EPHEMERAL_DEMO_WEBHOOK_SECRET = secrets.token_urlsafe(32)
 CANONICAL_OUTCOMES = ("APPROVED", "STEP-UP", "REVIEW / HOLD", "REJECTED")
 BORDERLINE_SIMILARITY_MARGIN = 0.08
 GENESIS_AUDIT_HASH = "0" * 64
+SIM_RECENT_SWAP_DAYS = 7
+CALL_VELOCITY_STEP_UP_THRESHOLD = 6
+CALL_VELOCITY_HOLD_THRESHOLD = 8
+
+CONTEXTUAL_RISK_RULES: dict[str, Any] = {
+    "sim_age_days": {
+        "threshold_lt": SIM_RECENT_SWAP_DAYS,
+        "outcome": "STEP-UP",
+        "reason_code": "RECENT_SIM_SWAP",
+        "simulated": True,
+    },
+    "device_changed": {
+        "trigger": True,
+        "outcome": "STEP-UP",
+        "reason_code": "DEVICE_CHANGED",
+        "simulated": True,
+    },
+    "call_velocity_1h": {
+        "step_up_gte": CALL_VELOCITY_STEP_UP_THRESHOLD,
+        "step_up_reason_code": "HIGH_CALL_VELOCITY",
+        "hold_gte": CALL_VELOCITY_HOLD_THRESHOLD,
+        "hold_reason_code": "CALL_VELOCITY_HOLD",
+    },
+    "time_of_day": {
+        "ist_window": "22:00-06:00 IST or weekend",
+        "outcome": "STEP-UP",
+        "reason_code": "AFTER_HOURS_COOLING_HOLD",
+    },
+}
 
 NON_VOICE_FALLBACK_OPTIONS: list[dict[str, Any]] = [
     {
@@ -50,6 +79,7 @@ GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
         },
         "after_hours_step_up": True,
         "simulated_alert_type": "SIM_SWAP_ATTEMPT_BLOCKED",
+        "contextual_rules": CONTEXTUAL_RISK_RULES,
     },
     "helpdesk": {
         "name": "helpdesk",
@@ -62,6 +92,7 @@ GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
             "wifi_support": {"label": "Corporate Wi-Fi Support", "protective_low_friction": True, "critical": False},
         },
         "privileged_role_manager_approval": True,
+        "contextual_rules": CONTEXTUAL_RISK_RULES,
     },
     "banking": {
         "name": "banking",
@@ -73,6 +104,7 @@ GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
         },
         "reads_risk_event": "SIM_SWAP_ATTEMPT_BLOCKED",
         "amount_step_up_threshold_inr": 100000,
+        "contextual_rules": CONTEXTUAL_RISK_RULES,
     },
     "campus": {
         "name": "campus",
@@ -82,6 +114,7 @@ GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
             "portal_recovery": {"label": "Student/Staff Portal Recovery", "protective_low_friction": False, "critical": False},
             "registered_contact_change": {"label": "Registered Contact Change", "protective_low_friction": False, "critical": True},
         },
+        "contextual_rules": CONTEXTUAL_RISK_RULES,
     },
 }
 
@@ -170,6 +203,9 @@ class SessionPolicyInput:
     asr_available: bool = True
     challenge_attempt: int = 1
     new_enrollment_cooldown: bool = False
+    sim_age_days: int | None = None
+    device_changed: bool = False
+    call_velocity_1h: int = 1
 
 
 @dataclass(frozen=True)
@@ -465,11 +501,29 @@ def evaluate_voice_authorization(
             emit_risk_alert=False,
         )
 
+    if session.call_velocity_1h >= CALL_VELOCITY_HOLD_THRESHOLD:
+        return AuthorizationDecision(
+            outcome="REVIEW / HOLD",
+            evidence_state="CONTEXTUAL_HOLD",
+            reason_codes=["CALL_VELOCITY_HOLD"],
+            next_step_script=(
+                "High verification velocity detected within the last hour. Routing to REVIEW / HOLD "
+                "with Non-Voice Accessibility Fallback."
+            ),
+            emit_risk_alert=False,
+        )
+
     step_up_reasons: list[str] = []
     if has_cross_domain_alert:
         step_up_reasons.append("CROSS_DOMAIN_ALERT")
     if session.new_enrollment_cooldown and critical_action:
         step_up_reasons.append("NEW_ENROLLMENT_COOLDOWN")
+    if session.sim_age_days is not None and session.sim_age_days < SIM_RECENT_SWAP_DAYS and critical_action:
+        step_up_reasons.append("RECENT_SIM_SWAP")
+    if session.device_changed and critical_action:
+        step_up_reasons.append("DEVICE_CHANGED")
+    if session.call_velocity_1h >= CALL_VELOCITY_STEP_UP_THRESHOLD:
+        step_up_reasons.append("HIGH_CALL_VELOCITY")
     if session.sector == "helpdesk" and session.privileged_role:
         step_up_reasons.append("PRIVILEGED_APPROVAL_REQUIRED")
     if session.sector == "telecom" and session.after_hours:

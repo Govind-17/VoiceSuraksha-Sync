@@ -19,6 +19,8 @@ load_dotenv(override=False)
 SESSION_COOKIE_NAME = "vs_session"
 TOKEN_TTL_SECONDS = 8 * 3600
 MIN_SECRET_LENGTH = 16
+PBKDF2_ITERATIONS = 600_000
+LEGACY_PBKDF2_ITERATIONS = 120_000
 KNOWN_DEFAULT_SECRETS = {
     "admin123",
     "change_me_admin_password",
@@ -87,24 +89,40 @@ def get_admin_credentials() -> tuple[str, str]:
     return username, password
 
 
-def hash_password(password: str) -> str:
-    """Hash a user password using PBKDF2-HMAC-SHA256 with a random 16-byte salt."""
+def verify_admin_credentials(username: str, password: str) -> bool:
+    """Constant-time UTF-8 byte comparison for admin credentials (safe on non-ASCII inputs)."""
+    admin_user, admin_pass = get_admin_credentials()
+    user_ok = hmac.compare_digest(username.encode("utf-8"), admin_user.encode("utf-8"))
+    pass_ok = hmac.compare_digest(password.encode("utf-8"), admin_pass.encode("utf-8"))
+    return bool(user_ok and pass_ok)
+
+
+def hash_password(password: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
+    """Hash a user password using PBKDF2-HMAC-SHA256 storing explicit iteration count."""
     salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
-    return f"pbkdf2_sha256${salt.hex()}${digest.hex()}"
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """Verify a plaintext password against a stored PBKDF2-HMAC-SHA256 hash."""
+    """Verify a plaintext password against current (4-part) or legacy (3-part) PBKDF2 hashes."""
     try:
-        scheme, salt_hex, digest_hex = stored_hash.split("$", 2)
-        if scheme != "pbkdf2_sha256":
+        parts = stored_hash.split("$")
+        if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+            iterations = int(parts[1])
+            if iterations < 1 or iterations > 5_000_000:
+                return False
+            salt = bytes.fromhex(parts[2])
+            expected = bytes.fromhex(parts[3])
+        elif len(parts) == 3 and parts[0] == "pbkdf2_sha256":
+            iterations = LEGACY_PBKDF2_ITERATIONS
+            salt = bytes.fromhex(parts[1])
+            expected = bytes.fromhex(parts[2])
+        else:
             return False
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
     except ValueError:
         return False
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return hmac.compare_digest(actual, expected)
 
 
@@ -161,19 +179,24 @@ def decode_session_token(token: str) -> AuthActor | None:
 
 
 def set_session_cookie(response: Response, token: str) -> None:
-    """Attach HttpOnly session cookie to response."""
+    """Attach HttpOnly session cookie to response (Secure enforced outside DEMO_MODE)."""
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
         max_age=TOKEN_TTL_SECONDS,
         httponly=True,
         samesite="lax",
+        secure=not is_demo_mode(),
     )
 
 
 def clear_session_cookie(response: Response) -> None:
     """Clear the session cookie on logout."""
-    response.delete_cookie(key=SESSION_COOKIE_NAME, samesite="lax")
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        samesite="lax",
+        secure=not is_demo_mode(),
+    )
 
 
 def get_optional_actor(request: Request) -> AuthActor | None:

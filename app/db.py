@@ -1,6 +1,7 @@
 """Database engine, durability helpers, and schema migrations for VoiceSuraksha-Sync."""
 
 import os
+import threading
 from collections.abc import Generator
 from pathlib import Path
 
@@ -8,7 +9,8 @@ from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
+_DB_INIT_LOCK = threading.Lock()
 
 
 def get_database_url() -> str:
@@ -90,6 +92,9 @@ def run_schema_migrations(target_engine=None) -> None:
         "verification_sessions": [
             ("parent_session_id", "VARCHAR(64)"),
             ("challenge_attempt", "INTEGER NOT NULL DEFAULT 1"),
+            ("sim_age_days", "INTEGER"),
+            ("device_changed", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
+            ("call_velocity_1h", "INTEGER NOT NULL DEFAULT 1"),
         ],
         "verification_telemetry": [
             ("perceptual_hash", "VARCHAR(32)"),
@@ -101,6 +106,7 @@ def run_schema_migrations(target_engine=None) -> None:
     }
 
     with eng.begin() as conn:
+        inspector = inspect(conn)
         for table_name, col_specs in migrations.items():
             if inspector.has_table(table_name):
                 existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
@@ -126,12 +132,13 @@ def run_schema_migrations(target_engine=None) -> None:
 
 
 def init_db(target_engine=None) -> None:
-    """Create all database tables and run lightweight migrations."""
+    """Create all database tables and run lightweight migrations (serialized lock-safe)."""
     from app import models  # noqa: F401
 
-    eng = target_engine or engine
-    Base.metadata.create_all(bind=eng)
-    run_schema_migrations(eng)
+    with _DB_INIT_LOCK:
+        eng = target_engine or engine
+        Base.metadata.create_all(bind=eng)
+        run_schema_migrations(eng)
 
 
 def get_db() -> Generator[Session, None, None]:
