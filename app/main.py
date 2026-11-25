@@ -16,9 +16,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db, init_db
@@ -41,6 +42,7 @@ load_dotenv(override=False)
 FRONTEND_INDEX = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
 MIN_ENROLL_SECONDS = 15.0
 MAX_ENROLL_SECONDS = 60.0
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB guard for Render free-tier memory
 SESSION_TTL_MINUTES = 2
 DECISION_TOKEN_TTL_MINUTES = 5
 RISK_EVENT_TTL_HOURS = 24
@@ -66,6 +68,17 @@ def _inspect_wav_duration(wav_bytes: bytes) -> float | None:
         return None
 
 
+async def _read_bounded_wav(file: UploadFile) -> bytes:
+    """Read uploaded audio safely with an upper byte bound."""
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded audio exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+        )
+    return data
+
+
 def get_detectif_client() -> DetectifClient:
     """Dependency provider for DetectifClient (overridable in tests)."""
     return DetectifClient()
@@ -83,6 +96,7 @@ app = FastAPI(
     description="Action-bound voice-security gateway powered by DetectifAI Eidos & Aletheia.",
     lifespan=lifespan,
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 class CreateSessionRequest(BaseModel):
@@ -101,13 +115,17 @@ class ConsumeDecisionRequest(BaseModel):
     resource_ref: str
 
 
-@app.get("/", include_in_schema=False)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 def serve_frontend():
     """Serve the single-file SOC UI directly at '/'."""
-    return FileResponse(FRONTEND_INDEX, media_type="text/html")
+    return FileResponse(
+        FRONTEND_INDEX,
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
-@app.get("/api/v1/health")
+@app.api_route("/api/v1/health", methods=["GET", "HEAD"])
 def health(db: Session = Depends(get_db)) -> dict[str, Any]:
     """Return gateway operational mode, available profiles, and enrolled speaker count."""
     demo_mode = os.getenv("DEMO_MODE", "false").lower() == "true"
@@ -189,6 +207,14 @@ def list_risk_events(db: Session = Depends(get_db)) -> dict[str, Any]:
     }
 
 
+@app.post("/api/v1/demo/clear-alerts")
+def clear_demo_alerts(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Clear active RiskEvent rows for demo reset while keeping enrolled Eidos speakers intact."""
+    result = db.execute(delete(RiskEvent).where(RiskEvent.risk_state == "ACTIVE"))
+    db.commit()
+    return {"status": "ok", "cleared_count": result.rowcount or 0}
+
+
 @app.post("/api/v1/enrollments")
 async def create_enrollment(
     subject_ref: str = Form(..., min_length=2, max_length=64),
@@ -202,7 +228,7 @@ async def create_enrollment(
     if not consent_confirmed:
         raise HTTPException(status_code=400, detail="Explicit speaker consent (consent_confirmed=true) is required.")
 
-    wav_bytes = await file.read()
+    wav_bytes = await _read_bounded_wav(file)
     if not wav_bytes:
         raise HTTPException(status_code=400, detail="Uploaded WAV file is empty.")
 
@@ -320,11 +346,12 @@ def create_verification_session(
 async def submit_verification_audio(
     session_id: str,
     spoken_transcript: str = Form(""),
+    strict_phrase: bool = Form(False),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
 ) -> dict[str, Any]:
-    """Verify phrase, call DetectifAI Eidos+Aletheia, run policy engine, and issue one-time token on PASS."""
+    """Call DetectifAI Eidos+Aletheia to verify voice, evaluate policy, and issue one-time token on PASS."""
     session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
     if session is None:
         raise HTTPException(status_code=404, detail="Verification session not found.")
@@ -333,7 +360,7 @@ async def submit_verification_audio(
         raise HTTPException(status_code=409, detail=f"Session '{session_id}' has already been processed ({session.status}).")
 
     now = utcnow()
-    wav_bytes = await file.read()
+    wav_bytes = await _read_bounded_wav(file)
     wav_duration = _inspect_wav_duration(wav_bytes) if wav_bytes else None
 
     active_risks = db.scalars(
@@ -346,11 +373,12 @@ async def submit_verification_audio(
 
     is_expired = now > _as_utc(session.expires_at)
     phrase_match = verify_phrase_match(session.challenge_text, spoken_transcript)
+    should_call_provider = not is_expired and (phrase_match or not strict_phrase)
 
     provider_res = None
     provider_error: str | None = None
 
-    if not is_expired and phrase_match:
+    if should_call_provider:
         enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
         if enrollment is None:
             provider_error = "enrollment_missing"
@@ -367,7 +395,7 @@ async def submit_verification_audio(
                 provider_error = exc.error_code
 
     voice_input = None
-    if not is_expired and phrase_match:
+    if should_call_provider:
         if provider_res is not None:
             voice_input = VoiceEvidenceInput(
                 speaker_decision=provider_res.speaker_decision,
@@ -391,6 +419,7 @@ async def submit_verification_audio(
         privileged_role=session.privileged_role,
         amount_inr=session.amount_inr,
         expired=is_expired,
+        require_phrase_match=strict_phrase,
     )
     evaluation = evaluate_voice_authorization(
         session=policy_session,

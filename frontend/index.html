@@ -342,6 +342,7 @@
         <span class="pill ok" id="health-pill"><span class="dot"></span><span id="health-text">CHECKING...</span></span>
         <span class="pill">ENROLLED: <strong id="enrolled-count">0</strong></span>
         <span class="pill warn" title="Cross-domain risk events and operator action locks are simulated locally">SIMULATED OPERATOR SIGNALS</span>
+        <button class="btn btn-ghost btn-sm" id="btn-clear-alerts" style="padding:5px 10px;font-size:11.5px;" onclick="clearDemoAlerts()" title="Clear active simulated risk alerts while keeping enrolled speakers intact">Clear Demo Alerts</button>
         <a href="#workspace" class="btn btn-primary btn-sm">Launch Console</a>
       </div>
     </div>
@@ -536,7 +537,7 @@
               <span class="small" id="session-id-label">No active session</span>
             </div>
             <div class="mono-box" id="challenge-box">
-              Generate a session to obtain a cryptographically random ~10–12s challenge phrase bound to the active sector, action, and resource.
+              Generate a session for a short prompt. Voice verification matches your voice (Eidos + Aletheia), not exact text matching.
             </div>
           </div>
 
@@ -547,17 +548,10 @@
               <span class="pill" id="verify-timer-pill">0.0s / 8–15s</span>
             </div>
             <div class="btn-row">
-              <button class="btn btn-ghost btn-sm" id="btn-rec-verify" onclick="toggleMic('verify')">Start Challenge Mic + SpeechRecognition</button>
+              <button class="btn btn-ghost btn-sm" id="btn-rec-verify" onclick="toggleMic('verify')">Start Live Voice Mic (8–15s)</button>
               <input type="file" id="file-verify" accept=".wav,audio/wav" onchange="onFilePicked('verify')" />
             </div>
             <canvas class="wave" id="waveform-canvas" width="600" height="68"></canvas>
-            <div style="margin-bottom:10px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                <label for="spoken-transcript" style="margin:0;">Spoken Transcript (SpeechRecognition / editable)</label>
-                <button class="btn btn-ghost btn-sm" style="padding:4px 10px;font-size:11.5px;" onclick="copyChallengeToTranscript()">Copy Challenge Text</button>
-              </div>
-              <textarea id="spoken-transcript" rows="2" placeholder="Spoken phrase captured via SpeechRecognition (or paste/type for backup WAV)..."></textarea>
-            </div>
             <div class="btn-row">
               <button class="btn btn-primary btn-sm" onclick="submitVoiceEvidence()">Verify Voice &amp; Deepfake Evidence</button>
               <span class="small" id="verify-file-info">No verification WAV captured yet</span>
@@ -786,8 +780,7 @@
         inputSr: 48000,
         startMs: 0,
         timerId: null,
-        rafId: null,
-        recognition: null
+        rafId: null
       }
     };
 
@@ -803,6 +796,23 @@
       const el = document.getElementById(id);
       el.className = "status-line" + (kind ? " " + kind : "");
       el.textContent = msg;
+    }
+
+    async function clearDemoAlerts() {
+      const btn = document.getElementById("btn-clear-alerts");
+      const orig = btn.textContent;
+      btn.disabled = true;
+      try {
+        const res = await apiJson("/api/v1/demo/clear-alerts", { method: "POST" });
+        await refreshAllPanels();
+        btn.textContent = `Cleared (${res.cleared_count ?? 0})`;
+        setTimeout(() => { btn.textContent = orig; }, 1800);
+      } catch (err) {
+        btn.textContent = "Clear Failed";
+        setTimeout(() => { btn.textContent = orig; }, 1800);
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     async function apiJson(url, opts = {}) {
@@ -1091,30 +1101,6 @@
       state.rec.rafId = requestAnimationFrame(drawLiveWaveform);
     }
 
-    function startSpeechRecognition() {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) return;
-      try {
-        const rec = new SR();
-        rec.lang = "en-US";
-        rec.continuous = true;
-        rec.interimResults = true;
-        let finalText = "";
-        rec.onresult = (event) => {
-          let interim = "";
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            const txt = event.results[i][0].transcript;
-            if (event.results[i].isFinal) finalText += " " + txt;
-            else interim += " " + txt;
-          }
-          document.getElementById("spoken-transcript").value = (finalText + " " + interim).trim();
-        };
-        rec.onerror = () => {};
-        rec.start();
-        state.rec.recognition = rec;
-      } catch (_) {}
-    }
-
     async function toggleMic(target) {
       if (state.rec.target === target) { await stopMic(); return; }
       if (state.rec.target !== null) return;
@@ -1151,8 +1137,6 @@
         otherBtn.disabled = true;
 
         if (target === "verify") {
-          document.getElementById("spoken-transcript").value = "";
-          startSpeechRecognition();
           drawLiveWaveform();
         }
 
@@ -1172,10 +1156,6 @@
       const target = state.rec.target;
       clearInterval(state.rec.timerId);
       cancelAnimationFrame(state.rec.rafId);
-      if (state.rec.recognition) {
-        try { state.rec.recognition.stop(); } catch (_) {}
-        state.rec.recognition = null;
-      }
       state.rec.proc.disconnect();
       state.rec.analyser.disconnect();
       state.rec.source.disconnect();
@@ -1204,7 +1184,7 @@
         document.getElementById("verify-file-info").textContent = `Recorded WAV (${dur}s, ${(blob.size / 1024).toFixed(0)} KB)`;
         const btn = document.getElementById("btn-rec-verify");
         btn.className = "btn btn-ghost btn-sm";
-        btn.textContent = "Start Challenge Mic + SpeechRecognition";
+        btn.textContent = "Start Live Voice Mic (8–15s)";
         document.getElementById("btn-rec-enroll").disabled = false;
         drawIdleWaveform();
       }
@@ -1308,18 +1288,12 @@
       state.challengeTimerId = setInterval(tick, 500);
     }
 
-    function copyChallengeToTranscript() {
-      if (!state.currentSession) return;
-      document.getElementById("spoken-transcript").value = state.currentSession.challenge_text;
-    }
-
     async function submitVoiceEvidence() {
       if (!state.currentSession) { setStatus("verify-status", "Generate an action-bound challenge first.", "warn"); return; }
       if (!state.verifyWavBlob) { setStatus("verify-status", "Record or upload a verification WAV file first.", "warn"); return; }
 
-      const transcript = document.getElementById("spoken-transcript").value.trim();
       const fd = new FormData();
-      fd.append("spoken_transcript", transcript);
+      fd.append("spoken_transcript", "");
       fd.append("file", state.verifyWavBlob, "verify.wav");
 
       setStatus("verify-status", "Calling DetectifAI Eidos + Aletheia & evaluating policy...", "");

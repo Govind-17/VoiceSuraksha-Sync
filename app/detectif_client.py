@@ -100,7 +100,8 @@ class DetectifClient:
         load_dotenv(override=False)
         self._api_key = api_key if api_key is not None else os.getenv("DETECTIF_API_KEY", "")
         self._base_url = (base_url or os.getenv("DETECTIF_BASE_URL", "https://platform.detectif.ai")).rstrip("/")
-        self._timeout = timeout_seconds
+        env_timeout = os.getenv("DETECTIF_TIMEOUT_SECONDS")
+        self._timeout = float(env_timeout) if env_timeout and timeout_seconds == 30.0 else timeout_seconds
         self._transport = transport
 
     def _build_client(self) -> httpx.Client:

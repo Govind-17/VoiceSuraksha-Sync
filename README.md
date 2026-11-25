@@ -31,3 +31,18 @@ uvicorn app.main:app --reload
 ```powershell
 pytest tests/test_gateway.py
 ```
+
+## Deploy to Render
+
+This repository includes [render.yaml](render.yaml) for one-click Render Web Service deployment:
+
+- **Build Command**: `pip install --upgrade pip && pip install -r requirements.txt`
+- **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers --forwarded-allow-ips='*'`
+- **Health Check Path**: `/api/v1/health`
+- **Environment Variables** (set in Render Dashboard):
+  - `DETECTIF_API_KEY` (secret — never commit)
+  - `DETECTIF_BASE_URL=https://platform.detectif.ai`
+  - `DEMO_MODE=false`
+  - Optional persistent SQLite: attach a Render Disk at `/var/data` and set `VOICESURAKSHA_DB_URL=sqlite:////var/data/voicesuraksha.db`
+
+> Render serves apps over HTTPS automatically, so browser microphone recording (`getUserMedia`) works out of the box.

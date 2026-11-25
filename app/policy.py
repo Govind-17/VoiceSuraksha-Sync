@@ -57,10 +57,8 @@ GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 _CHALLENGE_WORDS = [
-    "amber", "beacon", "cedar", "delta", "falcon", "glacier",
-    "harbor", "indigo", "jasper", "kestrel", "lantern", "meadow",
-    "nimbus", "orchid", "prairie", "quartz", "redwood", "saffron",
-    "timber", "verge", "willow", "zenith",
+    "blue", "green", "river", "cloud", "apple", "silver",
+    "ocean", "sunny", "tiger", "light", "happy", "music",
 ]
 
 _DIGIT_WORDS = {
@@ -98,6 +96,7 @@ class SessionPolicyInput:
     privileged_role: bool = False
     amount_inr: float | None = None
     expired: bool = False
+    require_phrase_match: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,15 +123,11 @@ def validate_sector_action(sector: str, action: str) -> dict[str, Any]:
 
 
 def generate_challenge_phrase(sector: str, action: str, resource_ref: str) -> str:
-    """Generate a cryptographically random ~10-12s spoken challenge bound to the action."""
-    code_words = [secrets.choice(_CHALLENGE_WORDS) for _ in range(4)]
-    digits = "".join(str(secrets.randbelow(10)) for _ in range(4))
-    spaced_digits = " ".join(digits)
+    """Generate a simple, short spoken prompt for live voice capture."""
+    code_words = [secrets.choice(_CHALLENGE_WORDS) for _ in range(2)]
+    digits = "".join(str(secrets.randbelow(10)) for _ in range(2))
     readable_action = action.replace("_", " ")
-    return (
-        f"I authorize {sector} {readable_action} for reference {resource_ref}. "
-        f"My live verification code is {' '.join(code_words)} {spaced_digits}."
-    )
+    return f"Confirm {readable_action} code {' '.join(code_words)} {digits}."
 
 
 def normalize_transcript(text: str) -> str:
@@ -192,7 +187,7 @@ def evaluate_voice_authorization(
             emit_risk_alert=False,
         )
 
-    if not phrase_match:
+    if session.require_phrase_match and not phrase_match:
         return AuthorizationDecision(
             outcome="REJECT_REQUEST",
             evidence_state="CHALLENGE_FAILED",

@@ -204,7 +204,7 @@ def test_wrong_phrase_and_session_replay(make_test_client):
 
     resp = client.post(
         f"/api/v1/verification-sessions/{sess['session_id']}/audio",
-        data={"spoken_transcript": "some completely wrong replayed phrase"},
+        data={"spoken_transcript": "some completely wrong replayed phrase", "strict_phrase": "true"},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     )
     assert resp.status_code == 200
@@ -534,3 +534,102 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
     assert short_res["outcome"] == "REVIEW / HOLD"
     assert short_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert short_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
+
+
+def test_clear_demo_alerts_keeps_enrollments_intact(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-601")
+
+    # Trigger a simulated SIM_SWAP_ATTEMPT_BLOCKED alert via phrase mismatch
+    tel_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-601",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-MASKED-6010",
+        },
+    ).json()
+    tel_res = client.post(
+        f"/api/v1/verification-sessions/{tel_sess['session_id']}/audio",
+        data={"spoken_transcript": "wrong phrase", "strict_phrase": "true"},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert tel_res["emitted_risk_event"]["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED"
+    assert len(client.get("/api/v1/risk-events").json()["risk_events"]) == 1
+
+    # Clear active demo alerts; enrollment must remain intact
+    cleared = client.post("/api/v1/demo/clear-alerts")
+    assert cleared.status_code == 200
+    assert cleared.json() == {"status": "ok", "cleared_count": 1}
+    assert client.get("/api/v1/risk-events").json()["risk_events"] == []
+    enrollments = client.get("/api/v1/enrollments").json()["enrollments"]
+    assert any(e["subject_ref"] == "SUB-601" for e in enrollments)
+
+    # Subsequent banking action with matching voice now passes cleanly
+    bank_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "banking",
+            "subject_ref": "SUB-601",
+            "action": "credit_limit_increase",
+            "resource_ref": "CARD-MASKED-6010",
+            "amount_inr": 50000,
+        },
+    ).json()
+    bank_res = client.post(
+        f"/api/v1/verification-sessions/{bank_sess['session_id']}/audio",
+        data={"spoken_transcript": bank_sess["challenge_text"]},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert bank_res["outcome"] == "PASS"
+    assert bank_res["decision_token"] is not None
+
+
+def test_voice_first_mode_passes_without_exact_transcript(make_test_client):
+    handler, captured_headers = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-701")
+
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-701",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-MASKED-7010",
+        },
+    ).json()
+    assert sess["challenge_text"].startswith("Confirm sim replacement code ")
+
+    # Even with different/empty spoken_transcript, voice-first mode runs Eidos + Aletheia and passes on voice match
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": "hi my name is govind testing our hackathon project"},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["phrase_match"] is False
+    assert data["outcome"] == "PASS"
+    assert data["voice_result"]["speaker_decision"] == "match"
+    assert data["voice_result"]["deepfake_verdict"] == "real"
+    assert data["decision_token"] is not None
+    assert len(captured_headers) == 2
+
+
+def test_render_readiness_head_health_and_upload_limit(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    assert client.head("/").status_code == 200
+    assert client.head("/api/v1/health").status_code == 200
+
+    oversized = b"0" * (15 * 1024 * 1024 + 10)
+    resp = client.post(
+        "/api/v1/enrollments",
+        data={"subject_ref": "SUB-BIG", "consent_confirmed": "true", "consent_ref": "C-BIG"},
+        files={"file": ("huge.wav", oversized, "audio/wav")},
+    )
+    assert resp.status_code == 413
