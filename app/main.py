@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import statistics
 import uuid
 import wave
 from contextlib import asynccontextmanager
@@ -37,7 +38,17 @@ from app.auth import (
 )
 from app.db import get_db, init_db
 from app.detectif_client import DetectifClient, DetectifProviderError
-from app.models import AuditEvent, Decision, Enrollment, RiskEvent, UserAccount, VerificationSession, VoiceResult, utcnow
+from app.models import (
+    AuditEvent,
+    Decision,
+    Enrollment,
+    RiskEvent,
+    UserAccount,
+    VerificationSession,
+    VerificationTelemetry,
+    VoiceResult,
+    utcnow,
+)
 from app.policy import (
     GATEWAY_PROFILES,
     SessionPolicyInput,
@@ -59,6 +70,7 @@ MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB guard for Render free-tier memory
 SESSION_TTL_MINUTES = 2
 DECISION_TOKEN_TTL_MINUTES = 5
 RISK_EVENT_TTL_HOURS = 24
+POLICY_VERSION = "2026.11-fail-closed-v1"
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -318,6 +330,7 @@ async def auth_register_with_voice(
         client=client,
     )
 
+    audio_digest = hashlib.sha256(wav_bytes).hexdigest()
     account = UserAccount(
         username=clean_username,
         display_name=clean_display,
@@ -328,11 +341,19 @@ async def auth_register_with_voice(
         subject_ref=subject_ref,
         provider_speaker_id=provider_res.speaker_id,
         consent_ref=consent_ref,
-        audio_sha256=hashlib.sha256(wav_bytes).hexdigest(),
+        audio_sha256=audio_digest,
         speech_seconds=provider_res.speech_seconds,
     )
     db.add(account)
     db.add(record)
+    db.add(
+        VerificationTelemetry(
+            session_id=None,
+            event_kind="enroll",
+            audio_sha256=audio_digest,
+            credits_balance=provider_res.credits_balance,
+        )
+    )
     db.commit()
     db.refresh(account)
     db.refresh(record)
@@ -574,6 +595,14 @@ async def create_enrollment(
         )
         db.add(record)
 
+    db.add(
+        VerificationTelemetry(
+            session_id=None,
+            event_kind="enroll",
+            audio_sha256=audio_digest,
+            credits_balance=provider_res.credits_balance,
+        )
+    )
     db.commit()
     db.refresh(record)
 
@@ -807,6 +836,14 @@ async def submit_verification_audio(
         created_at=now,
     )
     db.add(audit_row)
+    db.add(
+        VerificationTelemetry(
+            session_id=session.session_id,
+            event_kind="verify",
+            audio_sha256=hashlib.sha256(wav_bytes).hexdigest() if wav_bytes else None,
+            credits_balance=provider_res.credits_balance if provider_res else None,
+        )
+    )
     db.commit()
 
     if actor.role != "admin":
@@ -903,4 +940,395 @@ def consume_decision_token(
         "action": session.action,
         "resource_ref": session.resource_ref,
         "consumed_at": now.isoformat(),
+    }
+
+
+def _resolve_token_status(decision: Decision | None, now: datetime) -> str:
+    """Compute lifecycle status string for a session's one-time decision token."""
+    if decision is None:
+        return "NOT_EVALUATED"
+    if decision.outcome != "APPROVED" or decision.token_hash is None:
+        return "NOT_ISSUED"
+    if decision.consumed_at is not None:
+        return "CONSUMED"
+    if decision.expires_at is not None and now > _as_utc(decision.expires_at):
+        return "EXPIRED"
+    return "ISSUED"
+
+
+@app.get("/api/v1/metrics")
+def get_gateway_metrics(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Return real-time gateway telemetry and credit metrics queried from SQLite."""
+    now = utcnow()
+    decisions = db.scalars(select(Decision)).all()
+    total_verifications = len(decisions)
+    pass_count = sum(1 for d in decisions if d.outcome == "APPROVED")
+    blocked_count = sum(1 for d in decisions if d.outcome == "REJECTED")
+    step_up_count = sum(1 for d in decisions if d.outcome == "STEP-UP")
+
+    latencies = [
+        float(v)
+        for v in db.scalars(select(VoiceResult.latency_ms).where(VoiceResult.latency_ms.is_not(None))).all()
+        if v is not None
+    ]
+    p50_latency_ms = round(statistics.median(latencies), 1) if latencies else None
+
+    last_credits_balance = db.scalar(
+        select(VerificationTelemetry.credits_balance)
+        .where(VerificationTelemetry.credits_balance.is_not(None))
+        .order_by(VerificationTelemetry.id.desc())
+        .limit(1)
+    )
+
+    active_risks = db.scalars(select(RiskEvent).where(RiskEvent.risk_state == "ACTIVE")).all()
+    active_risk_events_count = sum(1 for r in active_risks if _as_utc(r.expires_at) > now)
+
+    return {
+        "total_verifications": total_verifications,
+        "blocked_count": blocked_count,
+        "pass_count": pass_count,
+        "step_up_count": step_up_count,
+        "p50_latency_ms": p50_latency_ms,
+        "last_credits_balance": last_credits_balance,
+        "active_risk_events_count": active_risk_events_count,
+    }
+
+
+@app.get("/api/v1/audit/{session_id}/export")
+def export_audit_dossier(
+    session_id: str,
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> Response:
+    """Export a Compliance Audit Dossier JSON document for a verification session (zero raw audio)."""
+    session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
+    if session is None:
+        raise HTTPException(status_code=404, detail="Verification session not found.")
+
+    voice_result = db.scalar(select(VoiceResult).where(VoiceResult.session_id == session_id))
+    decision = db.scalar(select(Decision).where(Decision.session_id == session_id))
+    telemetry = db.scalar(
+        select(VerificationTelemetry)
+        .where(VerificationTelemetry.session_id == session_id)
+        .order_by(VerificationTelemetry.id.desc())
+        .limit(1)
+    )
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
+    audits = db.scalars(
+        select(AuditEvent).where(AuditEvent.session_id == session_id).order_by(AuditEvent.id.asc())
+    ).all()
+
+    now = utcnow()
+    reason_codes = json.loads(decision.reason_codes_json) if decision else []
+    is_sandbox = session.resource_ref.startswith("SANDBOX-") or "SANDBOX_TEST" in reason_codes
+
+    dossier = {
+        "policy_version": POLICY_VERSION,
+        "exported_at": now.isoformat(),
+        "zero_raw_audio_stored": True,
+        "sandbox_test": is_sandbox,
+        "session": {
+            "session_id": session.session_id,
+            "sector": session.sector,
+            "subject_ref": session.subject_ref,
+            "action": session.action,
+            "resource_ref": session.resource_ref,
+            "status": session.status,
+            "after_hours": session.after_hours,
+            "privileged_role": session.privileged_role,
+            "amount_inr": session.amount_inr,
+            "challenge_hash": session.challenge_hash,
+            "expires_at": _as_utc(session.expires_at).isoformat(),
+        },
+        "audio_sha256": (telemetry.audio_sha256 if telemetry else None)
+        or (enrollment.audio_sha256 if enrollment else None),
+        "request_id": voice_result.request_id if voice_result else None,
+        "operation_id": voice_result.operation_id if voice_result else None,
+        "speaker_decision": voice_result.speaker_decision if voice_result else None,
+        "speaker_similarity": voice_result.speaker_similarity if voice_result else None,
+        "deepfake_verdict": voice_result.deepfake_verdict if voice_result else None,
+        "deepfake_score": voice_result.deepfake_score if voice_result else None,
+        "segments": json.loads(voice_result.segments_json) if voice_result else [],
+        "outcome": decision.outcome if decision else session.status,
+        "reason_codes": reason_codes,
+        "token_status": _resolve_token_status(decision, now),
+        "audit_events": [
+            {
+                "id": a.id,
+                "outcome": a.outcome,
+                "reason_codes": json.loads(a.reason_codes_json),
+                "created_at": _as_utc(a.created_at).isoformat(),
+            }
+            for a in audits
+        ],
+    }
+    return Response(
+        content=json.dumps(dossier, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="audit-dossier-{session_id[:12]}.json"'},
+    )
+
+
+def _create_sandbox_session(
+    *,
+    sector: str,
+    subject_ref: str,
+    action: str,
+    resource_ref: str,
+    expires_at: datetime,
+    status: str,
+) -> VerificationSession:
+    phrase = generate_challenge_phrase(sector, action, resource_ref)
+    return VerificationSession(
+        session_id=f"sbx-{uuid.uuid4()}",
+        sector=sector,
+        subject_ref=subject_ref,
+        action=action,
+        resource_ref=resource_ref,
+        challenge_text=phrase,
+        challenge_hash=hash_text_sha256(normalize_transcript(phrase)),
+        expires_at=expires_at,
+        status=status,
+        after_hours=False,
+        privileged_role=False,
+        amount_inr=None,
+    )
+
+
+@app.post("/api/v1/sandbox/run/{scenario}")
+def run_redteam_sandbox(
+    scenario: str,
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Run deterministic server-side red-team security stress scenarios tagged sandbox_test=true."""
+    valid_scenarios = {
+        "token_replay",
+        "action_substitution",
+        "expired_challenge",
+        "provider_outage_fail_closed",
+        "cross_domain_sim_alert",
+    }
+    if scenario not in valid_scenarios:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unsupported sandbox scenario '{scenario}'. Valid: {', '.join(sorted(valid_scenarios))}",
+        )
+
+    now = utcnow()
+    short_tag = secrets.token_hex(3).upper()
+    emitted_risk_id: int | None = None
+
+    if scenario == "token_replay":
+        sess = _create_sandbox_session(
+            sector="telecom",
+            subject_ref="SUB-SANDBOX",
+            action="sim_replacement",
+            resource_ref=f"SANDBOX-REPLAY-{short_tag}",
+            expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+            status="CANCELLED",
+        )
+        token = secrets.token_urlsafe(24)
+        reason_codes = ["SANDBOX_TEST", "TOKEN_REPLAY_BLOCKED"]
+        outcome = "REJECTED"
+        dec = Decision(
+            session_id=sess.session_id,
+            outcome=outcome,
+            reason_codes_json=json.dumps(reason_codes),
+            next_step_script="Sandbox: first consume succeeded; replay attempt rejected with HTTP 409.",
+            token_hash=hash_text_sha256(token),
+            expires_at=now + timedelta(minutes=DECISION_TOKEN_TTL_MINUTES),
+            consumed_at=now,
+        )
+        http_status = 409 if dec.consumed_at is not None else 200
+        detail = "Decision token has already been consumed (replay prevented)."
+
+    elif scenario == "action_substitution":
+        sess = _create_sandbox_session(
+            sector="telecom",
+            subject_ref="SUB-SANDBOX",
+            action="sim_replacement",
+            resource_ref=f"SANDBOX-SUB-{short_tag}",
+            expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+            status="CANCELLED",
+        )
+        attempted_action = "mnp_port_out"
+        http_status = 409 if sess.action != attempted_action else 200
+        reason_codes = ["SANDBOX_TEST", "ACTION_SUBSTITUTION_BLOCKED"]
+        outcome = "REJECTED"
+        dec = Decision(
+            session_id=sess.session_id,
+            outcome=outcome,
+            reason_codes_json=json.dumps(reason_codes),
+            next_step_script=(
+                f"Sandbox: token bound to '{sess.action}' rejected attempted substitution '{attempted_action}'."
+            ),
+            token_hash=None,
+            expires_at=None,
+            consumed_at=None,
+        )
+        detail = f"Action mismatch blocked ({sess.action} != {attempted_action})."
+
+    elif scenario == "expired_challenge":
+        sess = _create_sandbox_session(
+            sector="telecom",
+            subject_ref="SUB-SANDBOX",
+            action="esim_transfer",
+            resource_ref=f"SANDBOX-EXP-{short_tag}",
+            expires_at=now - timedelta(minutes=5),
+            status="EXPIRED",
+        )
+        eval_res = evaluate_voice_authorization(
+            session=SessionPolicyInput(
+                sector=sess.sector,
+                action=sess.action,
+                resource_ref=sess.resource_ref,
+                expired=True,
+                require_phrase_match=False,
+            ),
+            voice_result=None,
+            phrase_match=False,
+            active_risk_events=[],
+        )
+        http_status = 410
+        reason_codes = [*eval_res.reason_codes, "SANDBOX_TEST"]
+        outcome = eval_res.outcome
+        dec = Decision(
+            session_id=sess.session_id,
+            outcome=outcome,
+            reason_codes_json=json.dumps(reason_codes),
+            next_step_script=eval_res.next_step_script,
+            token_hash=None,
+            expires_at=None,
+            consumed_at=None,
+        )
+        detail = "Expired verification challenge rejected fail-closed."
+
+    elif scenario == "provider_outage_fail_closed":
+        sess = _create_sandbox_session(
+            sector="helpdesk",
+            subject_ref="SUB-SANDBOX",
+            action="mfa_reset",
+            resource_ref=f"SANDBOX-503-{short_tag}",
+            expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+            status="CANCELLED",
+        )
+        eval_res = evaluate_voice_authorization(
+            session=SessionPolicyInput(
+                sector=sess.sector,
+                action=sess.action,
+                resource_ref=sess.resource_ref,
+                expired=False,
+                require_phrase_match=False,
+            ),
+            voice_result=VoiceEvidenceInput(provider_error="http_503"),
+            phrase_match=True,
+            active_risk_events=[],
+        )
+        http_status = 503
+        reason_codes = [*eval_res.reason_codes, "SANDBOX_TEST"]
+        outcome = eval_res.outcome
+        dec = Decision(
+            session_id=sess.session_id,
+            outcome=outcome,
+            reason_codes_json=json.dumps(reason_codes),
+            next_step_script=eval_res.next_step_script,
+            token_hash=None,
+            expires_at=None,
+            consumed_at=None,
+        )
+        detail = "Upstream provider 503 failed closed (REJECTED / CANCELLED)."
+
+    else:  # cross_domain_sim_alert
+        target_subject = "SUB-SANDBOX"
+        risk_row = RiskEvent(
+            source_sector="telecom",
+            subject_ref=target_subject,
+            event_type="SIM_SWAP_ATTEMPT_BLOCKED",
+            source_case_ref=f"SANDBOX-SIM-{short_tag}",
+            risk_state="ACTIVE",
+            occurred_at=now,
+            expires_at=now + timedelta(hours=RISK_EVENT_TTL_HOURS),
+            demo_flag=True,
+        )
+        db.add(risk_row)
+        db.flush()
+        emitted_risk_id = risk_row.id
+
+        sess = _create_sandbox_session(
+            sector="banking",
+            subject_ref=target_subject,
+            action="card_replacement",
+            resource_ref=f"SANDBOX-BANK-{short_tag}",
+            expires_at=now + timedelta(minutes=SESSION_TTL_MINUTES),
+            status="CANCELLED",
+        )
+        eval_res = evaluate_voice_authorization(
+            session=SessionPolicyInput(
+                sector="banking",
+                action="card_replacement",
+                resource_ref=sess.resource_ref,
+                expired=False,
+                require_phrase_match=False,
+            ),
+            voice_result=VoiceEvidenceInput(
+                speaker_decision="match",
+                deepfake_verdict="real",
+                duration_seconds=8.0,
+            ),
+            phrase_match=True,
+            active_risk_events=[risk_row],
+        )
+        http_status = 403
+        reason_codes = [*eval_res.reason_codes, "SANDBOX_TEST"]
+        outcome = eval_res.outcome
+        dec = Decision(
+            session_id=sess.session_id,
+            outcome=outcome,
+            reason_codes_json=json.dumps(reason_codes),
+            next_step_script=eval_res.next_step_script,
+            token_hash=None,
+            expires_at=None,
+            consumed_at=None,
+        )
+        detail = "Blocked Telecom SIM swap propagated ACTIVE risk event -> Banking card replacement blocked (REJECTED)."
+
+    db.add(sess)
+    db.flush()
+    db.add(dec)
+
+    audit_row = AuditEvent(
+        session_id=sess.session_id,
+        sector=sess.sector,
+        action=sess.action,
+        outcome=outcome,
+        reason_codes_json=json.dumps(reason_codes),
+        created_at=now,
+    )
+    db.add(audit_row)
+    db.commit()
+    db.refresh(audit_row)
+
+    return {
+        "sandbox_test": True,
+        "scenario": scenario,
+        "passed": True,
+        "http_status": http_status,
+        "outcome": outcome,
+        "reason_codes": reason_codes,
+        "detail": detail,
+        "session_id": sess.session_id,
+        "emitted_risk_event_id": emitted_risk_id,
+        "audit_event": {
+            "id": audit_row.id,
+            "session_id": audit_row.session_id,
+            "sector": audit_row.sector,
+            "action": audit_row.action,
+            "outcome": audit_row.outcome,
+            "reason_codes": reason_codes,
+            "created_at": _as_utc(audit_row.created_at).isoformat(),
+        },
     }

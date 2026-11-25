@@ -132,3 +132,16 @@ class UserAccount(Base):
     subject_ref: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class VerificationTelemetry(Base):
+    """Additive telemetry log for audio SHA-256 digests and provider credit balances (zero raw audio)."""
+
+    __tablename__ = "verification_telemetry"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    event_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    audio_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    credits_balance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

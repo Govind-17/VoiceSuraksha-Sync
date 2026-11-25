@@ -296,6 +296,77 @@
     footer { background: var(--secondary); color: var(--silver); padding: 36px 0; }
     .footer-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 32px; align-items: center; }
     @media (max-width: 760px) { .footer-grid { grid-template-columns: 1fr; } }
+
+    /* Obsidian SOC Finals Upgrades */
+    .soc-ribbon {
+      background: linear-gradient(135deg, #0F171E 0%, #1C262B 100%);
+      border-bottom: 1px solid rgba(40, 203, 139, 0.32);
+      box-shadow: 0 8px 24px rgba(15, 23, 30, 0.18);
+      padding: 12px 0;
+      color: #E2E8F0;
+    }
+    .soc-ribbon-inner {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+    }
+    .soc-metrics-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .soc-metric-tile {
+      display: flex; align-items: center; gap: 10px;
+      padding: 7px 13px; border-radius: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(40, 203, 139, 0.22);
+    }
+    .soc-metric-lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: #94A3B8; font-family: var(--mono); }
+    .soc-metric-val { font-family: var(--mono); font-size: 15px; font-weight: 700; color: #28CB8B; }
+    .soc-metric-val.bad { color: #FF6B6B; }
+    .btn-obsidian-ghost {
+      background: rgba(255, 255, 255, 0.06); color: #E2E8F0;
+      border: 1px solid rgba(40, 203, 139, 0.35);
+      padding: 7px 12px; border-radius: 6px; font-size: 12px; font-family: var(--mono); cursor: pointer;
+    }
+    .btn-obsidian-ghost:hover:not(:disabled) { border-color: #28CB8B; color: #28CB8B; background: rgba(40, 203, 139, 0.12); }
+
+    .obsidian-card {
+      background: linear-gradient(160deg, #101820 0%, #1B252C 100%);
+      border: 1px solid rgba(40, 203, 139, 0.32);
+      box-shadow: 0 10px 28px rgba(15, 23, 30, 0.22);
+      border-radius: 10px; padding: 22px; color: #E2E8F0;
+    }
+    .obsidian-card .card-hdr { border-bottom-color: rgba(148, 163, 184, 0.18); }
+    .obsidian-card .card-title { color: #F8FAFC; }
+    .obsidian-card .step-tag { background: rgba(40, 203, 139, 0.16); color: #28CB8B; border: 1px solid rgba(40, 203, 139, 0.35); }
+    .sandbox-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+    @media (max-width: 980px) { .sandbox-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 560px) { .sandbox-grid { grid-template-columns: 1fr; } }
+    .sandbox-btn {
+      text-align: left; padding: 11px 12px; border-radius: 8px; cursor: pointer;
+      background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(148, 163, 184, 0.24);
+      color: #F1F5F9; font-family: var(--sans); transition: all 0.15s ease;
+    }
+    .sandbox-btn:hover:not(:disabled) { border-color: #28CB8B; background: rgba(40, 203, 139, 0.1); transform: translateY(-1px); }
+    .sandbox-btn strong { display: block; font-size: 12.5px; margin-bottom: 3px; color: #FFFFFF; }
+    .sandbox-btn span { display: block; font-family: var(--mono); font-size: 10.5px; color: #94A3B8; }
+    .sandbox-results { display: flex; flex-direction: column; gap: 8px; }
+    .sandbox-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+      padding: 10px 12px; border-radius: 8px; font-family: var(--mono); font-size: 11.5px;
+      background: rgba(15, 23, 30, 0.72); border: 1px solid rgba(40, 203, 139, 0.28);
+    }
+
+    .api-drawer {
+      margin-top: 20px; background: #101820; border: 1px solid rgba(40, 203, 139, 0.28);
+      border-radius: 10px; color: #E2E8F0; overflow: hidden;
+    }
+    .api-drawer summary {
+      list-style: none; cursor: pointer; padding: 14px 20px;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      font-weight: 600; font-size: 14.5px; color: #F8FAFC;
+    }
+    .api-drawer-body { padding: 0 20px 18px; border-top: 1px solid rgba(148, 163, 184, 0.16); }
+    .api-pre {
+      margin: 12px 0 0; padding: 14px; border-radius: 8px; overflow-x: auto;
+      background: #090E13; border: 1px solid rgba(148, 163, 184, 0.2);
+      font-family: var(--mono); font-size: 12px; line-height: 1.55; color: #A7F3D0;
+    }
   </style>
 </head>
 <body>
@@ -315,6 +386,7 @@
         <a href="#profiles">Profiles</a>
         <a href="#workspace">Gateway</a>
         <a href="#telemetry">Telemetry</a>
+        <a href="#sandbox">Sandbox</a>
         <a href="#audit">Audit</a>
       </nav>
 
@@ -516,6 +588,42 @@
 
   <!-- VIEW 2: ADMIN SOC DASHBOARD (visible ONLY when logged in as admin) -->
   <div id="admin-dashboard" class="hidden">
+    <!-- Live Metrics Ribbon -->
+    <div class="soc-ribbon">
+      <div class="container soc-ribbon-inner">
+        <div class="soc-metrics-group">
+          <div class="soc-metric-tile">
+            <div>
+              <div class="soc-metric-lbl">Total Checks</div>
+              <div class="soc-metric-val" id="metric-total-checks">0</div>
+            </div>
+          </div>
+          <div class="soc-metric-tile">
+            <div>
+              <div class="soc-metric-lbl">Real p50 Latency</div>
+              <div class="soc-metric-val" id="metric-p50-latency">-- ms</div>
+            </div>
+          </div>
+          <div class="soc-metric-tile">
+            <div>
+              <div class="soc-metric-lbl">Blocked Threats</div>
+              <div class="soc-metric-val bad" id="metric-blocked-threats">0</div>
+            </div>
+          </div>
+          <div class="soc-metric-tile">
+            <div>
+              <div class="soc-metric-lbl">DetectifAI Credits</div>
+              <div class="soc-metric-val" id="metric-credits-balance">--</div>
+            </div>
+          </div>
+        </div>
+        <div class="btn-row">
+          <span class="pill" style="background:rgba(40,203,139,0.14);border-color:rgba(40,203,139,0.4);color:#28CB8B;">ACTIVE ALERTS: <strong id="metric-active-alerts">0</strong></span>
+          <button class="btn-obsidian-ghost" id="btn-ribbon-clear-alerts" onclick="clearDemoAlerts()">Clear Demo Alerts</button>
+        </div>
+      </div>
+    </div>
+
     <section class="hero" id="top">
       <div class="container">
         <div class="hero-grid">
@@ -768,18 +876,69 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card" style="margin-bottom:20px;">
           <div class="card-hdr">
             <div class="card-title"><span class="step-tag">SQLITE</span> Live Audit Timeline</div>
             <button class="btn btn-ghost btn-sm" onclick="refreshAdminPanels()">Refresh Audit Log</button>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Time (UTC)</th><th>Sector</th><th>Action</th><th>Outcome</th><th>Reason Codes</th><th>Session</th></tr></thead>
-              <tbody id="audit-tbody"><tr><td colspan="6" class="small">No audit events recorded yet.</td></tr></tbody>
+              <thead><tr><th>Time (UTC)</th><th>Sector</th><th>Action</th><th>Outcome</th><th>Reason Codes</th><th>Session</th><th>Dossier</th></tr></thead>
+              <tbody id="audit-tbody"><tr><td colspan="7" class="small">No audit events recorded yet.</td></tr></tbody>
             </table>
           </div>
         </div>
+
+        <!-- Red-Team Attack Sandbox -->
+        <div class="obsidian-card" id="sandbox">
+          <div class="card-hdr">
+            <div class="card-title"><span class="step-tag">SANDBOX STRESS TEST</span> Red-Team Attack Sandbox</div>
+            <span class="pill" style="background:rgba(251,192,45,0.14);border-color:rgba(251,192,45,0.45);color:#FBC02D;">SERVER-SIDE DETERMINISTIC PROBES</span>
+          </div>
+          <p class="small" style="color:#94A3B8;margin:0 0 14px;">
+            Fire real server-side security stress scenarios tagged <code style="color:#28CB8B;">sandbox_test=true</code> to demonstrate replay prevention, action binding, challenge expiry, fail-closed outages, and cross-domain SIM-to-Bank escalation.
+          </p>
+          <div class="sandbox-grid">
+            <button class="sandbox-btn" onclick="runSandboxScenario('token_replay')">
+              <strong>Token Replay</strong>
+              <span>Expected: HTTP 409</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('action_substitution')">
+              <strong>Action Substitution</strong>
+              <span>Expected: HTTP 409</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('expired_challenge')">
+              <strong>Expired Challenge</strong>
+              <span>Expected: HTTP 410</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('provider_outage_fail_closed')">
+              <strong>Provider 503 Fail-Closed</strong>
+              <span>Expected: HTTP 503</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('cross_domain_sim_alert')">
+              <strong>Cross-Domain SIM→Bank</strong>
+              <span>Expected: HTTP 403 REJECTED</span>
+            </button>
+          </div>
+          <div class="sandbox-results" id="sandbox-results">
+            <div class="small" style="color:#94A3B8;">Click any red-team scenario above to execute a live server stress check.</div>
+          </div>
+        </div>
+
+        <!-- Collapsible Developer Gateway API Drawer -->
+        <details class="api-drawer" id="dev-api">
+          <summary>
+            <span>Developer Gateway API — Active Profile (<code id="dev-api-sector" style="color:#28CB8B;">telecom</code>)</span>
+            <span class="pill" style="background:rgba(40,203,139,0.12);border-color:rgba(40,203,139,0.35);color:#28CB8B;">Toggle cURL Snippet</span>
+          </summary>
+          <div class="api-drawer-body">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;">
+              <span class="small" style="color:#94A3B8;">Updates automatically as you switch between Telecom, Helpdesk, Banking, and Campus profiles.</span>
+              <button type="button" class="btn-obsidian-ghost" id="btn-copy-curl" onclick="copyGatewayCurl()">Copy cURL</button>
+            </div>
+            <pre class="api-pre" id="dev-api-curl"></pre>
+          </div>
+        </details>
       </div>
     </section>
   </div>
@@ -1264,29 +1423,45 @@
     /* ---------------- ADMIN SOC DASHBOARD FUNCTIONS ---------------- */
     async function clearDemoAlerts() {
       const btn = document.getElementById("btn-clear-alerts");
-      const orig = btn.textContent; btn.disabled = true;
+      const rBtn = document.getElementById("btn-ribbon-clear-alerts");
+      const orig = btn.textContent;
+      btn.disabled = true;
+      if (rBtn) rBtn.disabled = true;
       try {
         const res = await apiJson("/api/v1/demo/clear-alerts", { method: "POST" });
         await refreshAdminPanels();
-        btn.textContent = `Cleared (${res.cleared_count ?? 0})`;
-        setTimeout(() => { btn.textContent = orig; }, 1800);
+        const label = `Cleared (${res.cleared_count ?? 0})`;
+        btn.textContent = label;
+        if (rBtn) rBtn.textContent = label;
+        setTimeout(() => { btn.textContent = orig; if (rBtn) rBtn.textContent = "Clear Demo Alerts"; }, 1800);
       } catch (_) {
         btn.textContent = "Clear Failed";
-        setTimeout(() => { btn.textContent = orig; }, 1800);
-      } finally { btn.disabled = false; }
+        if (rBtn) rBtn.textContent = "Clear Failed";
+        setTimeout(() => { btn.textContent = orig; if (rBtn) rBtn.textContent = "Clear Demo Alerts"; }, 1800);
+      } finally {
+        btn.disabled = false;
+        if (rBtn) rBtn.disabled = false;
+      }
     }
 
     async function refreshAdminPanels() {
       try {
-        const [health, enrollRes, auditRes, riskRes] = await Promise.all([
+        const [health, enrollRes, auditRes, riskRes, metrics] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/enrollments"),
           apiJson("/api/v1/audit"),
-          apiJson("/api/v1/risk-events")
+          apiJson("/api/v1/risk-events"),
+          apiJson("/api/v1/metrics")
         ]);
         const enrolledCount = String(health.enrolled_count ?? (enrollRes.enrollments || []).length);
         document.getElementById("enrolled-count").textContent = enrolledCount;
         document.getElementById("stat-enrolled").textContent = enrolledCount;
+
+        document.getElementById("metric-total-checks").textContent = String(metrics.total_verifications ?? 0);
+        document.getElementById("metric-p50-latency").textContent = metrics.p50_latency_ms != null ? `${Number(metrics.p50_latency_ms).toFixed(1)} ms` : "-- ms";
+        document.getElementById("metric-blocked-threats").textContent = String(metrics.blocked_count ?? 0);
+        document.getElementById("metric-credits-balance").textContent = metrics.last_credits_balance != null ? Number(metrics.last_credits_balance).toLocaleString("en-US") : "--";
+        document.getElementById("metric-active-alerts").textContent = String(metrics.active_risk_events_count ?? 0);
 
         state.enrollments = enrollRes.enrollments || [];
         renderSubjectDropdown();
@@ -1339,6 +1514,7 @@
       renderPresetBox();
       refreshRiskBanner();
       updateActionLockUi();
+      renderDeveloperApiCurl();
     }
 
     function renderContextControls(sector, profile) {
@@ -1589,12 +1765,96 @@
 
     function renderAuditTable(rows) {
       const tbody = document.getElementById("audit-tbody");
-      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="6" class="small">No audit events recorded yet.</td></tr>`; return; }
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="7" class="small">No audit events recorded yet.</td></tr>`; return; }
       tbody.innerHTML = rows.slice(0, 25).map(r => {
         const color = r.outcome === "APPROVED" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : r.outcome === "REJECTED" ? "var(--error)" : "#9A6700";
         const ts = r.created_at ? new Date(r.created_at).toISOString().slice(11, 19) : "--";
-        return `<tr><td>${escapeHtml(ts)}</td><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td><td>${escapeHtml((r.reason_codes || []).join(", ") || "—")}</td><td>${escapeHtml(String(r.session_id || "").slice(0, 8))}…</td></tr>`;
+        const sid = String(r.session_id || "");
+        return `<tr><td>${escapeHtml(ts)}</td><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td><td>${escapeHtml((r.reason_codes || []).join(", ") || "—")}</td><td>${escapeHtml(sid.slice(0, 8))}…</td><td><button type="button" class="btn btn-ghost btn-sm" onclick="exportAuditDossier('${escapeHtml(sid)}')">Export Audit JSON</button></td></tr>`;
       }).join("");
+    }
+
+    async function exportAuditDossier(sessionId) {
+      if (!sessionId) return;
+      try {
+        const data = await apiJson(`/api/v1/audit/${encodeURIComponent(sessionId)}/export`);
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `audit-dossier-${sessionId.slice(0, 12)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        alert(`Audit export failed: ${err.message}`);
+      }
+    }
+
+    async function runSandboxScenario(scenario) {
+      const container = document.getElementById("sandbox-results");
+      try {
+        const res = await apiJson(`/api/v1/sandbox/run/${encodeURIComponent(scenario)}`, { method: "POST" });
+        const isStepUp = res.outcome === "STEP-UP";
+        const badgeClass = isStepUp ? "warn" : "bad";
+        const statusBadge = `<span class="pill ${badgeClass}">HTTP ${res.http_status} · ${escapeHtml(res.outcome)}</span>`;
+        const rowHtml = `<div class="sandbox-row">
+          <div>
+            <span class="pill ok" style="margin-right:6px;">SANDBOX STRESS TEST</span>
+            <strong>${escapeHtml(res.scenario)}</strong> — <span style="color:#CBD5E1;">${escapeHtml(res.detail)}</span>
+            <div style="color:#94A3B8;margin-top:4px;">Reasons: ${escapeHtml((res.reason_codes || []).join(", "))} · Session: ${escapeHtml(String(res.session_id || "").slice(0, 12))}</div>
+          </div>
+          <div class="btn-row">
+            ${statusBadge}
+            <button type="button" class="btn-obsidian-ghost" onclick="exportAuditDossier('${escapeHtml(res.session_id)}')">Export JSON</button>
+          </div>
+        </div>`;
+        if (container.querySelector(".small")) container.innerHTML = "";
+        container.insertAdjacentHTML("afterbegin", rowHtml);
+        await refreshAdminPanels();
+      } catch (err) {
+        container.insertAdjacentHTML("afterbegin", `<div class="sandbox-row"><span style="color:#FF6B6B;">Sandbox error: ${escapeHtml(err.message)}</span></div>`);
+      }
+    }
+
+    function renderDeveloperApiCurl() {
+      const sector = state.activeSector || "telecom";
+      const profile = state.profiles[sector] || {};
+      const actions = Object.keys(profile.actions || {});
+      const firstAction = actions[0] || "sim_replacement";
+      const resource = DEFAULT_RESOURCES[sector] || "REF-001";
+      const origin = window.location.origin;
+      const sectorLabel = document.getElementById("dev-api-sector");
+      if (sectorLabel) sectorLabel.textContent = sector;
+      const pre = document.getElementById("dev-api-curl");
+      if (!pre) return;
+      pre.textContent = [
+        `# 1) Start an action-bound ${sector} challenge session`,
+        `curl -X POST "${origin}/api/v1/verification-sessions" \\`,
+        `  -b cookies.txt -H "Content-Type: application/json" \\`,
+        `  -d '{"sector":"${sector}","subject_ref":"SUB-DEMO-01","action":"${firstAction}","resource_ref":"${resource}"}'`,
+        ``,
+        `# 2) Submit live 16kHz PCM WAV (Eidos + Aletheia fail-closed policy)`,
+        `curl -X POST "${origin}/api/v1/verification-sessions/<SESSION_ID>/audio" \\`,
+        `  -b cookies.txt -F "spoken_transcript=" -F "file=@sample_16k.wav"`,
+        ``,
+        `# 3) Export Compliance Audit Dossier (zero raw audio)`,
+        `curl -s "${origin}/api/v1/audit/<SESSION_ID>/export" -b cookies.txt -o audit-dossier.json`
+      ].join("\n");
+    }
+
+    async function copyGatewayCurl() {
+      const pre = document.getElementById("dev-api-curl");
+      const btn = document.getElementById("btn-copy-curl");
+      if (!pre || !btn) return;
+      try {
+        await navigator.clipboard.writeText(pre.textContent);
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy cURL"; }, 1600);
+      } catch (_) {
+        btn.textContent = "Copy failed";
+      }
     }
 
     bootstrap();

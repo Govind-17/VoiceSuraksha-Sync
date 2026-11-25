@@ -840,3 +840,134 @@ def test_register_with_voice_saves_voiceprint_and_login_skips_reenroll(make_test
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
     assert reenroll.status_code == 409
+
+
+def test_metrics_and_audit_dossier_export(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    # Empty state metrics check (and enrollment updates last_credits_balance)
+    _enroll_subject(client, "SUB-901")
+    empty_metrics = client.get("/api/v1/metrics")
+    assert empty_metrics.status_code == 200
+    em = empty_metrics.json()
+    assert em["total_verifications"] == 0
+    assert em["pass_count"] == 0
+    assert em["blocked_count"] == 0
+    assert em["p50_latency_ms"] is None
+    assert em["last_credits_balance"] == ENROLL_FIXTURE["credits"]["balance"]
+
+    # Run one APPROVED verification + consume token + one REJECTED verification
+    sess_ok = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-901",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-901",
+        },
+    ).json()
+    ok_res = client.post(
+        f"/api/v1/verification-sessions/{sess_ok['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert ok_res["outcome"] == "APPROVED"
+
+    # Export before consume -> token_status ISSUED
+    dossier_before = client.get(f"/api/v1/audit/{sess_ok['session_id']}/export")
+    assert dossier_before.status_code == 200
+    assert "attachment;" in dossier_before.headers.get("content-disposition", "")
+    dbj = dossier_before.json()
+    assert dbj["zero_raw_audio_stored"] is True
+    assert dbj["policy_version"]
+    assert dbj["token_status"] == "ISSUED"
+    assert dbj["audio_sha256"] and len(dbj["audio_sha256"]) == 64
+    assert dbj["request_id"] == VERIFY_FIXTURE["request_id"]
+    assert dbj["operation_id"] == VERIFY_FIXTURE["operation_id"]
+    assert dbj["speaker_decision"] == "match"
+    assert dbj["deepfake_verdict"] == "real"
+    assert len(dbj["segments"]) == len(VERIFY_FIXTURE["deepfake"]["segments"])
+
+    consume = client.post(
+        f"/api/v1/decisions/{sess_ok['session_id']}/consume",
+        json={
+            "decision_token": ok_res["decision_token"],
+            "action": "sim_replacement",
+            "resource_ref": "SIM-901",
+        },
+    )
+    assert consume.status_code == 200
+
+    # Export after consume -> token_status CONSUMED
+    dossier_after = client.get(f"/api/v1/audit/{sess_ok['session_id']}/export").json()
+    assert dossier_after["token_status"] == "CONSUMED"
+    assert len(dossier_after["audit_events"]) == 2
+    assert client.get("/api/v1/audit/missing-session/export").status_code == 404
+
+    # Trigger a blocked verification (<4s fails closed with REJECTED)
+    sess_bad = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "helpdesk",
+            "subject_ref": "SUB-901",
+            "action": "mfa_reset",
+            "resource_ref": "TKT-901",
+        },
+    ).json()
+    bad_res = client.post(
+        f"/api/v1/verification-sessions/{sess_bad['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("short.wav", make_pcm_wav_bytes(2.0), "audio/wav")},
+    ).json()
+    assert bad_res["outcome"] == "REJECTED"
+
+    metrics = client.get("/api/v1/metrics").json()
+    assert metrics["total_verifications"] == 2
+    assert metrics["pass_count"] == 1
+    assert metrics["blocked_count"] == 1
+    assert metrics["p50_latency_ms"] == round(float(VERIFY_FIXTURE["latency_ms"]), 1)
+    assert metrics["last_credits_balance"] == VERIFY_FIXTURE["credits"]["balance"]
+
+
+def test_redteam_sandbox_all_five_scenarios_and_clear_alerts(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-902")
+
+    expected = {
+        "token_replay": (409, "REJECTED", "TOKEN_REPLAY_BLOCKED"),
+        "action_substitution": (409, "REJECTED", "ACTION_SUBSTITUTION_BLOCKED"),
+        "expired_challenge": (410, "REJECTED", "CHALLENGE_EXPIRED"),
+        "provider_outage_fail_closed": (503, "REJECTED", "PROVIDER_UNAVAILABLE"),
+        "cross_domain_sim_alert": (403, "REJECTED", "CROSS_DOMAIN_ALERT"),
+    }
+
+    for scenario, (exp_http, exp_outcome, exp_reason) in expected.items():
+        resp = client.post(f"/api/v1/sandbox/run/{scenario}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["sandbox_test"] is True
+        assert data["scenario"] == scenario
+        assert data["http_status"] == exp_http
+        assert data["outcome"] == exp_outcome
+        assert "SANDBOX_TEST" in data["reason_codes"]
+        assert exp_reason in data["reason_codes"]
+        assert data["audit_event"]["session_id"] == data["session_id"]
+
+        # Confirm audit dossier export works cleanly on sandbox sessions
+        exp = client.get(f"/api/v1/audit/{data['session_id']}/export")
+        assert exp.status_code == 200
+        assert exp.json()["sandbox_test"] is True
+
+    assert client.post("/api/v1/sandbox/run/invalid_scenario").status_code == 404
+
+    # Cross-domain sandbox alert shows in metrics and clears cleanly without touching enrollments
+    m_before = client.get("/api/v1/metrics").json()
+    assert m_before["active_risk_events_count"] >= 1
+    cleared = client.post("/api/v1/demo/clear-alerts")
+    assert cleared.status_code == 200
+    assert cleared.json()["cleared_count"] >= 1
+    m_after = client.get("/api/v1/metrics").json()
+    assert m_after["active_risk_events_count"] == 0
+    assert len(client.get("/api/v1/enrollments").json()["enrollments"]) == 1
