@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
+
+DEFAULT_DEV_WEBHOOK_SECRET = "voicesuraksha-dev-webhook-secret"
 
 GATEWAY_PROFILES: dict[str, dict[str, Any]] = {
     "telecom": {
@@ -140,6 +145,24 @@ def normalize_transcript(text: str) -> str:
 def hash_text_sha256(value: str) -> str:
     """Return hex SHA-256 hash of a UTF-8 string."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def get_webhook_signing_secret() -> str:
+    """Load WEBHOOK_SIGNING_SECRET from environment with a safe development fallback."""
+    return os.getenv("WEBHOOK_SIGNING_SECRET", "").strip() or DEFAULT_DEV_WEBHOOK_SECRET
+
+
+def sign_risk_event_payload(payload: dict[str, Any], secret: str | None = None) -> str:
+    """Compute canonical HMAC-SHA256 signature for an outbound cross-domain RiskEvent webhook."""
+    key = (secret if secret is not None else get_webhook_signing_secret()).encode("utf-8")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, canonical, hashlib.sha256).hexdigest()
+
+
+def verify_risk_event_signature(payload: dict[str, Any], signature: str, secret: str | None = None) -> bool:
+    """Verify an HMAC-SHA256 webhook signature in constant time."""
+    expected = sign_risk_event_payload(payload, secret=secret)
+    return hmac.compare_digest(expected, str(signature or ""))
 
 
 def verify_phrase_match(challenge_text: str, spoken_transcript: str) -> bool:

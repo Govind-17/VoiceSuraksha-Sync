@@ -393,6 +393,7 @@
       <div class="nav-actions">
         <span class="pill ok" id="health-pill"><span class="dot"></span><span id="health-text">CHECKING...</span></span>
         <span class="pill info hidden" id="role-pill"></span>
+        <span class="pill hidden" id="storage-pill">DB: --</span>
         <span class="pill hidden" id="enrolled-pill">ENROLLED: <strong id="enrolled-count">0</strong></span>
         <span class="pill warn hidden" id="sim-pill">SIMULATED OPERATOR SIGNALS</span>
         <button class="btn btn-ghost btn-sm hidden" id="btn-clear-alerts" onclick="clearDemoAlerts()">Clear Demo Alerts</button>
@@ -562,6 +563,19 @@
                 <span class="pill" id="u-outcome-pill">PENDING</span>
               </div>
               <div class="mono-box" id="u-next-step">Your verification outcome and next-step instructions will appear here.</div>
+              <div class="card hidden" id="u-accessibility-fallback" style="margin-top:12px;border:1px solid #FBC02D;background:#FFFDF2;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
+                  <strong style="font-size:13.5px;color:#8A5A00;">Non-Voice Accessibility Fallback</strong>
+                  <span class="pill warn">INCONCLUSIVE AUDIO</span>
+                </div>
+                <p class="small" style="margin:0 0 10px;color:#5D4037;">Having mic issues, background noise, or a sore throat? Choose an alternative verification path without losing your request:</p>
+                <div class="btn-row">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'App Push Approval')">Trusted App Push</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'Verified Manager Callback')">Manager Callback</button>
+                </div>
+                <div class="status-line warn hidden" id="u-fallback-status"></div>
+              </div>
             </div>
           </div>
 
@@ -763,10 +777,18 @@
               </div>
               <div class="btn-row" style="margin-bottom:10px;">
                 <button class="btn btn-primary btn-sm" onclick="generateChallenge()">Generate Action-Bound Challenge</button>
+                <label class="check-row" style="margin:0;padding:5px 9px;font-size:11.5px;">
+                  <input type="checkbox" id="toggle-demo-helper" onchange="updateDemoHelperUi()" />
+                  <span>Testing Helper</span>
+                </label>
                 <span class="small" id="session-id-label">No active session</span>
               </div>
               <div class="mono-box" id="challenge-box">
                 Generate a session for a short prompt. Voice verification matches your voice (Eidos + Aletheia).
+              </div>
+              <div class="btn-row hidden" id="demo-copy-wrap" style="margin-top:8px;">
+                <span class="chip warn">DEMO HELPER</span>
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-challenge" onclick="copyChallengeText()">Copy Challenge Text</button>
               </div>
             </div>
 
@@ -828,7 +850,20 @@
                 <div class="m-cell" id="cell-match-fake"><div class="m-title">MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECTED (cancelled)</div></div>
                 <div class="m-cell" id="cell-nomatch-fake"><div class="m-title">NO_MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECTED (cancelled)</div></div>
               </div>
-              <div class="inconclusive-banner" id="inconclusive-banner">INCONCLUSIVE_EVIDENCE — Request REJECTED &amp; CANCELLED.</div>
+              <div class="inconclusive-banner" id="inconclusive-banner">INCONCLUSIVE_EVIDENCE — Audio quality / evidence check failed.</div>
+              <div class="card hidden" id="accessibility-fallback-card" style="margin-top:12px;border:1px solid #FBC02D;background:#FFFDF2;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
+                  <strong style="font-size:13.5px;color:#8A5A00;">Non-Voice Accessibility Fallback</strong>
+                  <span class="pill warn">NO GENUINE USER TRAPPED</span>
+                </div>
+                <p class="small" style="margin:0 0 10px;color:#5D4037;">Voice quality was too quiet, clipped, or inconclusive (no DetectifAI credits wasted). Route the user cleanly to a verified non-voice path:</p>
+                <div class="btn-row">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'App Push Approval')">App Push</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'Verified Manager Callback')">Manager Callback</button>
+                </div>
+                <div class="status-line warn hidden" id="admin-fallback-status"></div>
+              </div>
 
               <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--silver);">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1133,6 +1168,7 @@
       document.getElementById("admin-nav-links").classList.toggle("hidden", !isAdmin);
       document.getElementById("btn-logout").classList.toggle("hidden", !isAuth);
       document.getElementById("role-pill").classList.toggle("hidden", !isAuth);
+      document.getElementById("storage-pill").classList.toggle("hidden", !isAdmin);
       document.getElementById("enrolled-pill").classList.toggle("hidden", !isAdmin);
       document.getElementById("sim-pill").classList.toggle("hidden", !isAdmin);
       document.getElementById("btn-clear-alerts").classList.toggle("hidden", !isAdmin);
@@ -1148,6 +1184,7 @@
 
       if (isAdmin) {
         selectProfile(state.activeSector);
+        updateDemoHelperUi();
         await refreshAdminPanels();
         drawIdleWaveform("waveform-canvas");
       } else {
@@ -1159,16 +1196,29 @@
       }
     }
 
+    let heartbeatTimerId = null;
+
     async function bootstrap() {
       try {
         const [health, me] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/auth/me")
         ]);
+        state.serverMode = health.mode || "LIVE";
         document.getElementById("health-text").textContent = `${health.mode} · ${health.status.toUpperCase()}`;
+        const storagePill = document.getElementById("storage-pill");
+        if (storagePill && health.storage_backend) {
+          storagePill.textContent = `DB: ${String(health.storage_backend).toUpperCase()}`;
+          storagePill.className = "pill " + (health.storage_backend === "postgresql" ? "ok" : "warn") + (state.user?.role === "admin" ? "" : " hidden");
+        }
         await applyAuthState(me.authenticated ? me.user : null);
       } catch (err) {
         setStatus("auth-status", `Gateway error: ${err.message}`, "err");
+      }
+      if (!heartbeatTimerId) {
+        heartbeatTimerId = setInterval(() => {
+          fetch("/api/v1/health", { cache: "no-store" }).catch(() => {});
+        }, 4 * 60 * 1000);
       }
     }
 
@@ -1410,10 +1460,15 @@
       try {
         const res = await apiJson(`/api/v1/verification-sessions/${state.userSession.session_id}/audio`, { method: "POST", body: fd });
         const oPill = document.getElementById("u-outcome-pill");
-        oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : res.outcome === "REJECTED" ? "REJECTED — REQUEST CANCELLED" : res.outcome;
-        oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : res.outcome === "REJECTED" ? "bad" : "warn");
+        const isBlock = res.outcome === "REJECTED" || res.outcome === "REJECT_REQUEST";
+        oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : isBlock ? `${res.outcome} — REQUEST CANCELLED` : res.outcome;
+        oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : isBlock ? "bad" : "warn");
         document.getElementById("u-next-step").textContent = res.next_step_script || "";
-        setStatus("u-verify-status", `Result: ${oPill.textContent}`, res.outcome === "APPROVED" ? "ok" : "err");
+        const showFallback = res.evidence_state === "INCONCLUSIVE_EVIDENCE" || (res.reason_codes || []).includes("AUDIO_QUALITY_LOW");
+        document.getElementById("u-accessibility-fallback").classList.toggle("hidden", !showFallback);
+        const fbStatus = document.getElementById("u-fallback-status");
+        if (fbStatus && !showFallback) fbStatus.classList.add("hidden");
+        setStatus("u-verify-status", `Result: ${oPill.textContent}`, res.outcome === "APPROVED" ? "ok" : isBlock ? "err" : "warn");
         await refreshUserDashboard();
       } catch (err) {
         setStatus("u-verify-status", err.message, "err");
@@ -1686,7 +1741,13 @@
 
       ["cell-match-real", "cell-nomatch-real", "cell-match-fake", "cell-nomatch-fake"].forEach(id => { document.getElementById(id).className = "m-cell"; });
       const incBanner = document.getElementById("inconclusive-banner"); incBanner.classList.remove("visible");
-      if (res.evidence_state === "INCONCLUSIVE_EVIDENCE" || res.evidence_state === "CHALLENGE_FAILED") {
+      const fallbackCard = document.getElementById("accessibility-fallback-card");
+      const showFallback = res.evidence_state === "INCONCLUSIVE_EVIDENCE" || (res.reason_codes || []).includes("AUDIO_QUALITY_LOW");
+      if (fallbackCard) fallbackCard.classList.toggle("hidden", !showFallback);
+      const adminFbStatus = document.getElementById("admin-fallback-status");
+      if (adminFbStatus && !showFallback) adminFbStatus.classList.add("hidden");
+
+      if (res.evidence_state === "INCONCLUSIVE_EVIDENCE" || res.evidence_state === "CHALLENGE_FAILED" || res.evidence_state === "REPLAY_DETECTED") {
         incBanner.textContent = `${res.evidence_state} — ${(res.reason_codes || []).join(", ")}`; incBanner.classList.add("visible");
       } else if (eDecision === "match" && aVerdict === "real") {
         document.getElementById("cell-match-real").classList.add("active", res.outcome === "APPROVED" ? "pass" : res.outcome === "REJECTED" ? "reject" : "hold");
@@ -1699,8 +1760,9 @@
       }
 
       const oPill = document.getElementById("outcome-pill");
-      oPill.textContent = res.outcome === "APPROVED" ? "OUTCOME: APPROVED" : res.outcome === "REJECTED" ? "OUTCOME: REJECTED (CANCELLED)" : `OUTCOME: ${res.outcome}`;
-      oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : res.outcome === "REJECTED" ? "bad" : "warn");
+      const isBlock = res.outcome === "REJECTED" || res.outcome === "REJECT_REQUEST";
+      oPill.textContent = res.outcome === "APPROVED" ? "OUTCOME: APPROVED" : isBlock ? `OUTCOME: ${res.outcome} (CANCELLED)` : `OUTCOME: ${res.outcome}`;
+      oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : isBlock ? "bad" : "warn");
 
       const chipsEl = document.getElementById("reason-chips"); chipsEl.innerHTML = "";
       const codes = res.reason_codes && res.reason_codes.length ? res.reason_codes : ["ALL_CHECKS_PASSED"];
@@ -1767,11 +1829,39 @@
       const tbody = document.getElementById("audit-tbody");
       if (!rows.length) { tbody.innerHTML = `<tr><td colspan="7" class="small">No audit events recorded yet.</td></tr>`; return; }
       tbody.innerHTML = rows.slice(0, 25).map(r => {
-        const color = r.outcome === "APPROVED" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : r.outcome === "REJECTED" ? "var(--error)" : "#9A6700";
+        const color = r.outcome === "APPROVED" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : (r.outcome === "REJECTED" || r.outcome === "REJECT_REQUEST") ? "var(--error)" : "#9A6700";
         const ts = r.created_at ? new Date(r.created_at).toISOString().slice(11, 19) : "--";
         const sid = String(r.session_id || "");
         return `<tr><td>${escapeHtml(ts)}</td><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td><td>${escapeHtml((r.reason_codes || []).join(", ") || "—")}</td><td>${escapeHtml(sid.slice(0, 8))}…</td><td><button type="button" class="btn btn-ghost btn-sm" onclick="exportAuditDossier('${escapeHtml(sid)}')">Export Audit JSON</button></td></tr>`;
       }).join("");
+    }
+
+    function updateDemoHelperUi() {
+      const toggle = document.getElementById("toggle-demo-helper");
+      const wrap = document.getElementById("demo-copy-wrap");
+      if (!wrap) return;
+      const show = state.serverMode === "DEMO" || Boolean(toggle && toggle.checked);
+      wrap.classList.toggle("hidden", !show);
+    }
+
+    async function copyChallengeText() {
+      const box = document.getElementById("challenge-box");
+      const btn = document.getElementById("btn-copy-challenge");
+      if (!box || !btn) return;
+      try {
+        await navigator.clipboard.writeText(box.textContent.trim());
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy Challenge Text"; }, 1500);
+      } catch (_) {
+        btn.textContent = "Copy failed";
+      }
+    }
+
+    function selectAccessibilityFallback(targetStatusId, method) {
+      const el = document.getElementById(targetStatusId);
+      if (!el) return;
+      el.classList.remove("hidden");
+      setStatus(targetStatusId, `Accessibility Fallback Initiated: ${method} — request routed without locking out genuine user.`, "warn");
     }
 
     async function exportAuditDossier(sessionId) {

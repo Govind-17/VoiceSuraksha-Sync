@@ -145,3 +145,15 @@ class VerificationTelemetry(Base):
     audio_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     credits_balance: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class RiskWebhookDispatch(Base):
+    """Cryptographically HMAC-SHA256 signed webhook payloads attached to RiskEvents."""
+
+    __tablename__ = "risk_webhook_dispatches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    risk_event_id: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
+    hmac_signature: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

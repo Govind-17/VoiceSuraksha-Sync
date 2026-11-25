@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.asr import ServerASRAdapter
+from app.audio_quality import AudioQualityReport, inspect_pcm_wav_quality
 from app.auth import (
     AuthActor,
     clear_session_cookie,
@@ -36,13 +38,14 @@ from app.auth import (
     set_session_cookie,
     verify_password,
 )
-from app.db import get_db, init_db
+from app.db import get_db, get_storage_backend, init_db
 from app.detectif_client import DetectifClient, DetectifProviderError
 from app.models import (
     AuditEvent,
     Decision,
     Enrollment,
     RiskEvent,
+    RiskWebhookDispatch,
     UserAccount,
     VerificationSession,
     VerificationTelemetry,
@@ -51,12 +54,14 @@ from app.models import (
 )
 from app.policy import (
     GATEWAY_PROFILES,
+    AuthorizationDecision,
     SessionPolicyInput,
     VoiceEvidenceInput,
     evaluate_voice_authorization,
     generate_challenge_phrase,
     hash_text_sha256,
     normalize_transcript,
+    sign_risk_event_payload,
     validate_sector_action,
     verify_phrase_match,
 )
@@ -151,6 +156,13 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
+class OfflineSwapCallbackRequest(BaseModel):
+    subject_ref: str = Field(..., min_length=2, max_length=64)
+    store_id: str = Field("RETAIL-BLR-01", min_length=2, max_length=64)
+    sim_iccid_masked: str = Field("SIM-OFFLINE-001", min_length=2, max_length=64)
+    after_hours: bool = False
+
+
 def _actor_dict(actor: AuthActor) -> dict[str, Any]:
     return {
         "username": actor.username,
@@ -186,6 +198,7 @@ def health(
         "status": "ok",
         "service": "voicelock-gateway",
         "mode": "DEMO" if demo_mode else "LIVE",
+        "storage_backend": get_storage_backend(),
         "profiles": list(GATEWAY_PROFILES.keys()),
     }
     if actor is not None:
@@ -517,29 +530,89 @@ def list_audit(
     }
 
 
+def _emit_signed_risk_event(
+    db: Session,
+    *,
+    source_sector: str,
+    subject_ref: str,
+    event_type: str,
+    source_case_ref: str,
+    now: datetime,
+    demo_flag: bool = True,
+) -> tuple[RiskEvent, dict[str, Any]]:
+    """Persist a cross-domain RiskEvent and attach an HMAC-SHA256 webhook signature."""
+    expires_at = now + timedelta(hours=RISK_EVENT_TTL_HOURS)
+    risk_row = RiskEvent(
+        source_sector=source_sector,
+        subject_ref=subject_ref,
+        event_type=event_type,
+        source_case_ref=source_case_ref,
+        risk_state="ACTIVE",
+        occurred_at=now,
+        expires_at=expires_at,
+        demo_flag=demo_flag,
+    )
+    db.add(risk_row)
+    db.flush()
+
+    signed_payload = {
+        "id": risk_row.id,
+        "event_type": risk_row.event_type,
+        "source_sector": risk_row.source_sector,
+        "subject_ref": risk_row.subject_ref,
+        "source_case_ref": risk_row.source_case_ref,
+        "risk_state": risk_row.risk_state,
+        "occurred_at": _as_utc(risk_row.occurred_at).isoformat(),
+        "expires_at": _as_utc(risk_row.expires_at).isoformat(),
+    }
+    signature = sign_risk_event_payload(signed_payload)
+    db.add(
+        RiskWebhookDispatch(
+            risk_event_id=risk_row.id,
+            hmac_signature=signature,
+            payload_json=json.dumps(signed_payload, sort_keys=True, separators=(",", ":")),
+        )
+    )
+    return risk_row, {
+        "id": risk_row.id,
+        "event_type": risk_row.event_type,
+        "subject_ref": risk_row.subject_ref,
+        "risk_state": risk_row.risk_state,
+        "demo_flag": risk_row.demo_flag,
+        "hmac_signature": signature,
+        "signed_payload": signed_payload,
+    }
+
+
 @app.get("/api/v1/risk-events")
 def list_risk_events(
     db: Session = Depends(get_db),
     _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
-    """List cross-domain risk events (admin only)."""
+    """List cross-domain risk events with HMAC webhook signatures (admin only)."""
     rows = db.scalars(select(RiskEvent).order_by(RiskEvent.id.desc())).all()
-    return {
-        "risk_events": [
-            {
-                "id": r.id,
-                "source_sector": r.source_sector,
-                "subject_ref": r.subject_ref,
-                "event_type": r.event_type,
-                "source_case_ref": r.source_case_ref,
-                "risk_state": r.risk_state,
-                "occurred_at": _as_utc(r.occurred_at).isoformat(),
-                "expires_at": _as_utc(r.expires_at).isoformat(),
-                "demo_flag": r.demo_flag,
-            }
-            for r in rows
-        ]
+    dispatches = {
+        d.risk_event_id: d
+        for d in db.scalars(select(RiskWebhookDispatch)).all()
     }
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        dispatch = dispatches.get(r.id)
+        item = {
+            "id": r.id,
+            "source_sector": r.source_sector,
+            "subject_ref": r.subject_ref,
+            "event_type": r.event_type,
+            "source_case_ref": r.source_case_ref,
+            "risk_state": r.risk_state,
+            "occurred_at": _as_utc(r.occurred_at).isoformat(),
+            "expires_at": _as_utc(r.expires_at).isoformat(),
+            "demo_flag": r.demo_flag,
+            "hmac_signature": dispatch.hmac_signature if dispatch else None,
+            "signed_payload": json.loads(dispatch.payload_json) if dispatch else None,
+        }
+        items.append(item)
+    return {"risk_events": items}
 
 
 @app.post("/api/v1/demo/clear-alerts")
@@ -548,9 +621,77 @@ def clear_demo_alerts(
     _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
     """Clear active RiskEvent rows for demo reset (admin only)."""
+    active_ids = list(db.scalars(select(RiskEvent.id).where(RiskEvent.risk_state == "ACTIVE")).all())
+    if active_ids:
+        db.execute(delete(RiskWebhookDispatch).where(RiskWebhookDispatch.risk_event_id.in_(active_ids)))
     result = db.execute(delete(RiskEvent).where(RiskEvent.risk_state == "ACTIVE"))
     db.commit()
     return {"status": "ok", "cleared_count": result.rowcount or 0}
+
+
+@app.post("/api/v1/telecom/offline-swap-callback")
+def trigger_offline_swap_callback(
+    body: OfflineSwapCallbackRequest,
+    db: Session = Depends(get_db),
+    actor: AuthActor = Depends(get_current_actor),
+) -> dict[str, Any]:
+    """Trigger a VoiceSuraksha verification session from a simulated retail offline SIM swap."""
+    if actor.role != "admin" and body.subject_ref != actor.subject_ref:
+        raise HTTPException(status_code=403, detail="Users may only trigger callbacks for their own subject_ref.")
+
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == body.subject_ref))
+    if enrollment is None:
+        raise HTTPException(status_code=404, detail=f"Subject '{body.subject_ref}' is not enrolled.")
+
+    now = utcnow()
+    session_id = str(uuid.uuid4())
+    resource_ref = f"OFFLINE-{body.store_id}-{body.sim_iccid_masked}"[:128]
+    challenge_text = generate_challenge_phrase("telecom", "sim_replacement", resource_ref)
+    challenge_hash = hash_text_sha256(normalize_transcript(challenge_text))
+    expires_at = now + timedelta(minutes=SESSION_TTL_MINUTES)
+
+    session = VerificationSession(
+        session_id=session_id,
+        sector="telecom",
+        subject_ref=body.subject_ref,
+        action="sim_replacement",
+        resource_ref=resource_ref,
+        challenge_text=challenge_text,
+        challenge_hash=challenge_hash,
+        expires_at=expires_at,
+        status="PENDING",
+        after_hours=body.after_hours,
+        privileged_role=False,
+        amount_inr=None,
+    )
+    db.add(session)
+    db.add(
+        AuditEvent(
+            session_id=session_id,
+            sector="telecom",
+            action="sim_replacement",
+            outcome="CALLBACK_TRIGGERED",
+            reason_codes_json=json.dumps(["OFFLINE_RETAIL_SIM_SWAP"]),
+            created_at=now,
+        )
+    )
+    db.commit()
+    db.refresh(session)
+
+    return {
+        "callback_required": True,
+        "trigger": "OFFLINE_RETAIL_SIM_SWAP",
+        "store_id": body.store_id,
+        "session_id": session.session_id,
+        "sector": session.sector,
+        "subject_ref": session.subject_ref,
+        "action": session.action,
+        "resource_ref": session.resource_ref,
+        "challenge_text": session.challenge_text,
+        "challenge_hash": session.challenge_hash,
+        "expires_at": _as_utc(session.expires_at).isoformat(),
+        "status": session.status,
+    }
 
 
 @app.post("/api/v1/enrollments")
@@ -694,6 +835,12 @@ async def submit_verification_audio(
     now = utcnow()
     wav_bytes = await _read_bounded_wav(file)
     wav_duration = _inspect_wav_duration(wav_bytes) if wav_bytes else None
+    audio_digest = hashlib.sha256(wav_bytes).hexdigest() if wav_bytes else None
+
+    if not spoken_transcript:
+        asr_result = ServerASRAdapter().transcribe_wav(wav_bytes)
+        if asr_result.transcript:
+            spoken_transcript = asr_result.transcript
 
     active_risks = db.scalars(
         select(RiskEvent).where(
@@ -705,7 +852,33 @@ async def submit_verification_audio(
 
     is_expired = now > _as_utc(session.expires_at)
     phrase_match = verify_phrase_match(session.challenge_text, spoken_transcript)
-    should_call_provider = not is_expired and (phrase_match or not strict_phrase)
+
+    replayed_telemetry = (
+        db.scalar(
+            select(VerificationTelemetry)
+            .where(
+                VerificationTelemetry.event_kind == "verify",
+                VerificationTelemetry.audio_sha256 == audio_digest,
+                VerificationTelemetry.session_id != session.session_id,
+            )
+            .limit(1)
+        )
+        if (not is_expired and audio_digest)
+        else None
+    )
+
+    quality_report: AudioQualityReport | None = None
+    if (
+        replayed_telemetry is None
+        and not is_expired
+        and wav_bytes
+        and (wav_duration is None or wav_duration >= 4.0)
+        and (phrase_match or not strict_phrase)
+    ):
+        quality_report = inspect_pcm_wav_quality(wav_bytes)
+
+    quality_failed = bool(quality_report is not None and quality_report.valid_wav and not quality_report.passed)
+    should_call_provider = not is_expired and replayed_telemetry is None and not quality_failed and (phrase_match or not strict_phrase)
 
     provider_res = None
     provider_error: str | None = None
@@ -726,46 +899,69 @@ async def submit_verification_audio(
             except DetectifProviderError as exc:
                 provider_error = exc.error_code
 
-    voice_input = None
-    if should_call_provider:
-        if provider_res is not None:
-            voice_input = VoiceEvidenceInput(
-                speaker_decision=provider_res.speaker_decision,
-                deepfake_verdict=provider_res.deepfake_verdict,
-                duration_seconds=provider_res.duration_seconds,
-                provider_error=None,
-            )
-        else:
-            voice_input = VoiceEvidenceInput(
-                speaker_decision=None,
-                deepfake_verdict=None,
-                duration_seconds=wav_duration,
-                provider_error=provider_error,
-            )
+    if replayed_telemetry is not None:
+        action_meta = validate_sector_action(session.sector, session.action)
+        evaluation = AuthorizationDecision(
+            outcome="REJECT_REQUEST",
+            evidence_state="REPLAY_DETECTED",
+            reason_codes=["AUDIO_REPLAY_DETECTED"],
+            next_step_script=(
+                "Request blocked: identical verification WAV audio was already submitted in a prior session."
+            ),
+            emit_risk_alert=(session.sector == "telecom" and bool(action_meta.get("critical", False))),
+        )
+    elif quality_failed:
+        evaluation = AuthorizationDecision(
+            outcome="REVIEW / HOLD",
+            evidence_state="INCONCLUSIVE_EVIDENCE",
+            reason_codes=["AUDIO_QUALITY_LOW"],
+            next_step_script=(
+                "Audio quality inconclusive (silent or clipped). Use Non-Voice Accessibility Fallback: "
+                "Trusted App Push, In-Store Biometric KYC, or Verified Manager Callback."
+            ),
+            emit_risk_alert=False,
+        )
+    else:
+        voice_input = None
+        if should_call_provider:
+            if provider_res is not None:
+                voice_input = VoiceEvidenceInput(
+                    speaker_decision=provider_res.speaker_decision,
+                    deepfake_verdict=provider_res.deepfake_verdict,
+                    duration_seconds=provider_res.duration_seconds,
+                    provider_error=None,
+                )
+            else:
+                voice_input = VoiceEvidenceInput(
+                    speaker_decision=None,
+                    deepfake_verdict=None,
+                    duration_seconds=wav_duration,
+                    provider_error=provider_error,
+                )
 
-    policy_session = SessionPolicyInput(
-        sector=session.sector,
-        action=session.action,
-        resource_ref=session.resource_ref,
-        after_hours=session.after_hours,
-        privileged_role=session.privileged_role,
-        amount_inr=session.amount_inr,
-        expired=is_expired,
-        require_phrase_match=strict_phrase,
-    )
-    evaluation = evaluate_voice_authorization(
-        session=policy_session,
-        voice_result=voice_input,
-        phrase_match=phrase_match,
-        active_risk_events=unexpired_risks,
-    )
+        policy_session = SessionPolicyInput(
+            sector=session.sector,
+            action=session.action,
+            resource_ref=session.resource_ref,
+            after_hours=session.after_hours,
+            privileged_role=session.privileged_role,
+            amount_inr=session.amount_inr,
+            expired=is_expired,
+            require_phrase_match=strict_phrase,
+        )
+        evaluation = evaluate_voice_authorization(
+            session=policy_session,
+            voice_result=voice_input,
+            phrase_match=phrase_match,
+            active_risk_events=unexpired_risks,
+        )
 
     if is_expired:
         session.status = "EXPIRED"
     elif evaluation.outcome == "APPROVED":
         session.status = "APPROVED"
-    elif evaluation.outcome == "STEP-UP":
-        session.status = "STEP_UP"
+    elif evaluation.outcome in {"STEP-UP", "REVIEW / HOLD"}:
+        session.status = "HOLD" if evaluation.outcome == "REVIEW / HOLD" else "STEP_UP"
     else:
         session.status = "CANCELLED"
 
@@ -807,25 +1003,15 @@ async def submit_verification_audio(
 
     emitted_risk_event: dict[str, Any] | None = None
     if evaluation.emit_risk_alert:
-        risk_row = RiskEvent(
+        _, emitted_risk_event = _emit_signed_risk_event(
+            db,
             source_sector=session.sector,
             subject_ref=session.subject_ref,
             event_type="SIM_SWAP_ATTEMPT_BLOCKED",
             source_case_ref=session.session_id,
-            risk_state="ACTIVE",
-            occurred_at=now,
-            expires_at=now + timedelta(hours=RISK_EVENT_TTL_HOURS),
+            now=now,
             demo_flag=True,
         )
-        db.add(risk_row)
-        db.flush()
-        emitted_risk_event = {
-            "id": risk_row.id,
-            "event_type": risk_row.event_type,
-            "subject_ref": risk_row.subject_ref,
-            "risk_state": risk_row.risk_state,
-            "demo_flag": risk_row.demo_flag,
-        }
 
     audit_row = AuditEvent(
         session_id=session.session_id,
@@ -840,11 +1026,25 @@ async def submit_verification_audio(
         VerificationTelemetry(
             session_id=session.session_id,
             event_kind="verify",
-            audio_sha256=hashlib.sha256(wav_bytes).hexdigest() if wav_bytes else None,
+            audio_sha256=audio_digest,
             credits_balance=provider_res.credits_balance if provider_res else None,
         )
     )
     db.commit()
+
+    quality_payload = (
+        {
+            "valid_wav": quality_report.valid_wav,
+            "duration_sec": quality_report.duration_sec,
+            "rms_dbfs": quality_report.rms_dbfs,
+            "silence_ratio": quality_report.silence_ratio,
+            "clipping_ratio": quality_report.clipping_ratio,
+            "passed": quality_report.passed,
+            "reason": quality_report.reason,
+        }
+        if quality_report is not None
+        else None
+    )
 
     if actor.role != "admin":
         return {
@@ -855,6 +1055,7 @@ async def submit_verification_audio(
             "outcome": evaluation.outcome,
             "reason_codes": evaluation.reason_codes,
             "next_step_script": evaluation.next_step_script,
+            "audio_quality": quality_payload,
             "voice_summary": {
                 "speaker_decision": voice_row.speaker_decision,
                 "deepfake_verdict": voice_row.deepfake_verdict,
@@ -870,6 +1071,7 @@ async def submit_verification_audio(
         "outcome": evaluation.outcome,
         "reason_codes": evaluation.reason_codes,
         "next_step_script": evaluation.next_step_script,
+        "audio_quality": quality_payload,
         "decision_token": plaintext_token,
         "token_expires_at": token_expires_at.isoformat() if token_expires_at else None,
         "voice_result": {
@@ -966,7 +1168,7 @@ def get_gateway_metrics(
     decisions = db.scalars(select(Decision)).all()
     total_verifications = len(decisions)
     pass_count = sum(1 for d in decisions if d.outcome == "APPROVED")
-    blocked_count = sum(1 for d in decisions if d.outcome == "REJECTED")
+    blocked_count = sum(1 for d in decisions if d.outcome in {"REJECTED", "REJECT_REQUEST"})
     step_up_count = sum(1 for d in decisions if d.outcome == "STEP-UP")
 
     latencies = [
@@ -1244,18 +1446,15 @@ def run_redteam_sandbox(
 
     else:  # cross_domain_sim_alert
         target_subject = "SUB-SANDBOX"
-        risk_row = RiskEvent(
+        risk_row, _ = _emit_signed_risk_event(
+            db,
             source_sector="telecom",
             subject_ref=target_subject,
             event_type="SIM_SWAP_ATTEMPT_BLOCKED",
             source_case_ref=f"SANDBOX-SIM-{short_tag}",
-            risk_state="ACTIVE",
-            occurred_at=now,
-            expires_at=now + timedelta(hours=RISK_EVENT_TTL_HOURS),
+            now=now,
             demo_flag=True,
         )
-        db.add(risk_row)
-        db.flush()
         emitted_risk_id = risk_row.id
 
         sess = _create_sandbox_session(

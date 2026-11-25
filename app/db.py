@@ -11,8 +11,19 @@ DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
 
 
 def get_database_url() -> str:
-    """Return the configured SQLite URL."""
-    return os.getenv("VOICESURAKSHA_DB_URL", DEFAULT_DB_URL)
+    """Return configured database URL (Render DATABASE_URL, VOICESURAKSHA_DB_URL, or local SQLite)."""
+    url = (os.getenv("DATABASE_URL") or os.getenv("VOICESURAKSHA_DB_URL") or DEFAULT_DB_URL).strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url.removeprefix("postgres://")
+    return url
+
+
+def get_storage_backend(database_url: str | None = None) -> str:
+    """Return human-readable storage backend identifier ('postgresql' or 'sqlite_ephemeral')."""
+    url = (database_url or get_database_url()).lower()
+    if url.startswith("postgresql"):
+        return "postgresql"
+    return "sqlite_ephemeral"
 
 
 def _ensure_sqlite_parent_dir(url: str) -> None:

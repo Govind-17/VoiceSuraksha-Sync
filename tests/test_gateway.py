@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import io
 import json
+import math
+import struct
 import wave
 from datetime import timedelta
 from pathlib import Path
@@ -14,25 +16,45 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
-from app.db import Base, create_db_engine
+from app.asr import ServerASRAdapter
+from app.db import Base, create_db_engine, get_database_url, get_storage_backend
 from app.detectif_client import DetectifClient
 from app.main import app, get_db, get_detectif_client
 from app.models import AuditEvent, Enrollment, VerificationSession, utcnow
+from app.policy import verify_risk_event_signature
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 ENROLL_FIXTURE = json.loads((FIXTURES_DIR / "eidos_enroll.json").read_text(encoding="utf-8"))
 VERIFY_FIXTURE = json.loads((FIXTURES_DIR / "eidos_verify_with_deepfake.json").read_text(encoding="utf-8"))
+_WAV_NONCE = 0
 
 
-def make_pcm_wav_bytes(duration_seconds: float, sample_rate: int = 16000) -> bytes:
-    """Create minimal valid 16kHz mono 16-bit PCM WAV bytes in memory for tests."""
+def make_pcm_wav_bytes(
+    duration_seconds: float,
+    sample_rate: int = 16000,
+    *,
+    silent: bool = False,
+    clipped: bool = False,
+) -> bytes:
+    """Create valid 16kHz mono 16-bit PCM WAV bytes in memory for tests."""
+    global _WAV_NONCE
+    _WAV_NONCE += 1
     num_frames = int(duration_seconds * sample_rate)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        wf.writeframes(b"\x00\x00" * num_frames)
+        if silent:
+            wf.writeframes(b"\x00\x00" * num_frames)
+        elif clipped:
+            frames = struct.pack(f"<{num_frames}h", *(32767 if i % 2 == 0 else -32768 for i in range(num_frames)))
+            wf.writeframes(frames)
+        else:
+            freq = 220.0 + (_WAV_NONCE % 97) * 7.0
+            amp = 6500.0  # ~ -14 dBFS clean non-clipped speech-level tone, unique per call
+            samples = [int(amp * math.sin(2.0 * math.pi * freq * i / sample_rate)) for i in range(num_frames)]
+            wf.writeframes(struct.pack(f"<{num_frames}h", *samples))
     return buf.getvalue()
 
 
@@ -971,3 +993,176 @@ def test_redteam_sandbox_all_five_scenarios_and_clear_alerts(make_test_client):
     m_after = client.get("/api/v1/metrics").json()
     assert m_after["active_risk_events_count"] == 0
     assert len(client.get("/api/v1/enrollments").json()["enrollments"]) == 1
+
+
+def test_audio_replay_detected_even_when_transcript_matches(make_test_client):
+    handler, captured_headers = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-RPL-1")
+
+    reused_wav = make_pcm_wav_bytes(6.0)
+    sess1 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-RPL-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-RPL-1",
+        },
+    ).json()
+    res1 = client.post(
+        f"/api/v1/verification-sessions/{sess1['session_id']}/audio",
+        data={"spoken_transcript": sess1["challenge_text"]},
+        files={"file": ("verify.wav", reused_wav, "audio/wav")},
+    ).json()
+    assert res1["outcome"] == "APPROVED"
+    assert len(captured_headers) == 2
+
+    # Second session submits the IDENTICAL WAV bytes even with matching transcript -> blocked!
+    sess2 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-RPL-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-RPL-2",
+        },
+    ).json()
+    res2 = client.post(
+        f"/api/v1/verification-sessions/{sess2['session_id']}/audio",
+        data={"spoken_transcript": sess2["challenge_text"]},
+        files={"file": ("replay.wav", reused_wav, "audio/wav")},
+    ).json()
+    assert res2["outcome"] == "REJECT_REQUEST"
+    assert res2["status"] == "CANCELLED"
+    assert res2["evidence_state"] == "REPLAY_DETECTED"
+    assert res2["reason_codes"] == ["AUDIO_REPLAY_DETECTED"]
+    assert res2["decision_token"] is None
+    assert len(captured_headers) == 2  # DetectifAI was NOT called again
+    assert ServerASRAdapter(enabled=False).transcribe_wav(reused_wav).enabled is False
+
+
+def test_hmac_signature_verification_on_sim_swap_alert(make_test_client, monkeypatch):
+    monkeypatch.setenv("WEBHOOK_SIGNING_SECRET", "finals-hmac-secret-2026")
+    fake_verify = copy.deepcopy(VERIFY_FIXTURE)
+    fake_verify["deepfake"]["verdict"] = "fake"
+    fake_verify["deepfake"]["is_synthetic"] = True
+
+    handler, _ = _default_fixture_handler(verify_override=fake_verify)
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-HMAC-1")
+
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-HMAC-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-HMAC-1",
+        },
+    ).json()
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("fake.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    risk = res["emitted_risk_event"]
+    assert risk["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED"
+    assert len(risk["hmac_signature"]) == 64
+    assert verify_risk_event_signature(risk["signed_payload"], risk["hmac_signature"]) is True
+
+    # Tampered payload must fail HMAC verification
+    tampered = dict(risk["signed_payload"], subject_ref="SUB-ATTACKER")
+    assert verify_risk_event_signature(tampered, risk["hmac_signature"]) is False
+
+    stored = client.get("/api/v1/risk-events").json()["risk_events"]
+    assert stored[0]["hmac_signature"] == risk["hmac_signature"]
+
+
+def test_offline_sim_swap_callback_and_storage_backend(make_test_client, monkeypatch):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-OFF-1")
+
+    health = client.get("/api/v1/health").json()
+    assert health["storage_backend"] == "sqlite_ephemeral"
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/voicesuraksha")
+    assert get_database_url() == "postgresql://user:pass@localhost:5432/voicesuraksha"
+    assert get_storage_backend() == "postgresql"
+    monkeypatch.delenv("DATABASE_URL")
+
+    cb = client.post(
+        "/api/v1/telecom/offline-swap-callback",
+        json={
+            "subject_ref": "SUB-OFF-1",
+            "store_id": "STORE-BLR-09",
+            "sim_iccid_masked": "ICCID-8821",
+        },
+    )
+    assert cb.status_code == 200, cb.text
+    body = cb.json()
+    assert body["callback_required"] is True
+    assert body["trigger"] == "OFFLINE_RETAIL_SIM_SWAP"
+    assert body["sector"] == "telecom"
+    assert body["action"] == "sim_replacement"
+    assert body["resource_ref"] == "OFFLINE-STORE-BLR-09-ICCID-8821"
+    assert body["status"] == "PENDING"
+
+    # Voice verification completes the retail callback session cleanly
+    ver = client.post(
+        f"/api/v1/verification-sessions/{body['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("cb.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert ver["outcome"] == "APPROVED"
+
+
+def test_silent_and_clipped_audio_quality_low_skips_detectif_provider(make_test_client):
+    handler, captured_headers = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-AQ-1")
+    assert len(captured_headers) == 1
+
+    # Silent audio (< -45 dBFS) -> REVIEW / HOLD + AUDIO_QUALITY_LOW without calling DetectifAI
+    sess_sil = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-AQ-1",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-AQ-SIL",
+        },
+    ).json()
+    sil_res = client.post(
+        f"/api/v1/verification-sessions/{sess_sil['session_id']}/audio",
+        data={"spoken_transcript": sess_sil["challenge_text"]},
+        files={"file": ("silent.wav", make_pcm_wav_bytes(6.0, silent=True), "audio/wav")},
+    ).json()
+    assert sil_res["outcome"] == "REVIEW / HOLD"
+    assert sil_res["status"] == "HOLD"
+    assert sil_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
+    assert sil_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
+    assert sil_res["audio_quality"]["rms_dbfs"] < -45.0
+    assert len(captured_headers) == 1
+
+    # Heavily clipped audio (clipping_ratio > 0.15) -> also routes to REVIEW / HOLD without calling DetectifAI
+    sess_clip = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "helpdesk",
+            "subject_ref": "SUB-AQ-1",
+            "action": "mfa_reset",
+            "resource_ref": "TKT-AQ-CLIP",
+        },
+    ).json()
+    clip_res = client.post(
+        f"/api/v1/verification-sessions/{sess_clip['session_id']}/audio",
+        data={"spoken_transcript": sess_clip["challenge_text"]},
+        files={"file": ("clipped.wav", make_pcm_wav_bytes(6.0, clipped=True), "audio/wav")},
+    ).json()
+    assert clip_res["outcome"] == "REVIEW / HOLD"
+    assert clip_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
+    assert clip_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
+    assert clip_res["audio_quality"]["clipping_ratio"] > 0.15
+    assert len(captured_headers) == 1
