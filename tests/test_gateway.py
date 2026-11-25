@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import math
@@ -12,17 +13,20 @@ from datetime import timedelta
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 from app.asr import ServerASRAdapter, ServerASRResult
+from app.audio_fingerprint import MAX_PERCEPTUAL_HAMMING_BITS, compute_perceptual_hash, hamming_distance_hex
 from app.auth import validate_live_secrets
 from app.db import Base, CURRENT_SCHEMA_VERSION, create_db_engine, get_database_url, get_storage_backend, init_db, is_storage_durable
 from app.detectif_client import DetectifClient
 from app.main import _is_ist_after_hours, app, get_asr_adapter, get_db, get_detectif_client
 from app.models import AuditEvent, Enrollment, SchemaVersion, VerificationSession, utcnow
 from app.policy import normalize_transcript, verify_phrase_match, verify_risk_event_signature
+from app.rate_limit import gateway_rate_limiter
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 ENROLL_FIXTURE = json.loads((FIXTURES_DIR / "eidos_enroll.json").read_text(encoding="utf-8"))
@@ -52,10 +56,25 @@ def make_pcm_wav_bytes(
             frames = struct.pack(f"<{num_frames}h", *(32767 if i % 2 == 0 else -32768 for i in range(num_frames)))
             wf.writeframes(frames)
         else:
-            freq = 220.0 + (_WAV_NONCE % 97) * 7.0
-            amp = 6500.0  # ~ -14 dBFS clean non-clipped speech-level tone, unique per call
-            samples = [int(amp * math.sin(2.0 * math.pi * freq * i / sample_rate)) for i in range(num_frames)]
-            wf.writeframes(struct.pack(f"<{num_frames}h", *samples))
+            # Synthesize distinct time-varying formant-like chords per nonce so
+            # perceptual spectral fingerprints separate distinct clips while
+            # staying invariant under volume scaling and slight trimming.
+            rng = np.random.default_rng(_WAV_NONCE * 7919 + 17)
+            t = np.arange(num_frames, dtype=np.float64) / float(sample_rate)
+            sig = np.zeros(num_frames, dtype=np.float64)
+            band_freqs = np.geomspace(180.0, 4200.0, 9)
+            win_edges = np.linspace(0, num_frames, 10, dtype=int)
+            for w in range(9):
+                s0, s1 = int(win_edges[w]), int(win_edges[w + 1])
+                gains = rng.uniform(0.15, 1.8, size=len(band_freqs))
+                tw = t[s0:s1]
+                chunk = np.zeros(s1 - s0, dtype=np.float64)
+                for f_hz, g in zip(band_freqs, gains):
+                    chunk += g * np.sin(2.0 * math.pi * f_hz * tw)
+                sig[s0:s1] = chunk
+            rms = float(np.sqrt(np.mean(sig * sig))) or 1.0
+            pcm = np.clip((sig / rms) * 6500.0, -28000.0, 28000.0).astype("<i2")
+            wf.writeframes(pcm.tobytes())
     return buf.getvalue()
 
 
@@ -83,6 +102,7 @@ def make_mock_client(handler) -> DetectifClient:
 @pytest.fixture()
 def make_test_client(db_session_factory, monkeypatch):
     def _factory(mock_handler, *, auto_login_admin: bool = True, demo_mode: bool = False):
+        gateway_rate_limiter.reset()
         monkeypatch.setenv("DEMO_MODE", "true" if demo_mode else "false")
         monkeypatch.setenv("AUTH_SECRET", "pytest-live-auth-secret-32-chars-ok")
         monkeypatch.setenv("WEBHOOK_SIGNING_SECRET", "pytest-live-webhook-secret-32-chars")
@@ -152,6 +172,7 @@ def _enroll_subject(client: TestClient, subject_ref: str = "SUB-104") -> dict:
             "subject_ref": subject_ref,
             "consent_confirmed": "true",
             "consent_ref": f"CONSENT-{subject_ref}",
+            "consent_text": "Explicit speaker consent confirmed for voiceprint enrollment.",
         },
         files={"file": ("enroll.wav", wav_16s, "audio/wav")},
     )
@@ -172,7 +193,12 @@ def test_happy_path_telecom_sim_replacement_and_consume(make_test_client, db_ses
     # Consent required (HTTP 400 if false)
     bad_consent = client.post(
         "/api/v1/enrollments",
-        data={"subject_ref": "SUB-104", "consent_confirmed": "false", "consent_ref": "C-0"},
+        data={
+            "subject_ref": "SUB-104",
+            "consent_confirmed": "false",
+            "consent_ref": "C-0",
+            "consent_text": "Explicit speaker consent confirmed for testing.",
+        },
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
     assert bad_consent.status_code == 400
@@ -180,7 +206,12 @@ def test_happy_path_telecom_sim_replacement_and_consume(make_test_client, db_ses
     # Too short enrollment rejected (HTTP 400)
     short_enroll = client.post(
         "/api/v1/enrollments",
-        data={"subject_ref": "SUB-104", "consent_confirmed": "true", "consent_ref": "C-0"},
+        data={
+            "subject_ref": "SUB-104",
+            "consent_confirmed": "true",
+            "consent_ref": "C-0",
+            "consent_text": "Explicit speaker consent confirmed for testing.",
+        },
         files={"file": ("short.wav", make_pcm_wav_bytes(5.0), "audio/wav")},
     )
     assert short_enroll.status_code == 400
@@ -721,7 +752,12 @@ def test_render_readiness_head_health_and_upload_limit(make_test_client):
     oversized = b"0" * (15 * 1024 * 1024 + 10)
     resp = client.post(
         "/api/v1/enrollments",
-        data={"subject_ref": "SUB-BIG", "consent_confirmed": "true", "consent_ref": "C-BIG"},
+        data={
+            "subject_ref": "SUB-BIG",
+            "consent_confirmed": "true",
+            "consent_ref": "C-BIG",
+            "consent_text": "Explicit speaker consent confirmed for testing.",
+        },
         files={"file": ("huge.wav", oversized, "audio/wav")},
     )
     assert resp.status_code == 413
@@ -766,7 +802,12 @@ def test_user_register_login_and_strict_isolation(make_test_client):
     assert (
         client.post(
             "/api/v1/enrollments",
-            data={"subject_ref": "SUB-OTHER", "consent_confirmed": "true", "consent_ref": "C-1"},
+            data={
+                "subject_ref": "SUB-OTHER",
+                "consent_confirmed": "true",
+                "consent_ref": "C-1",
+                "consent_text": "Explicit speaker consent confirmed for testing.",
+            },
             files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
         ).status_code
         == 403
@@ -870,6 +911,7 @@ def test_register_with_voice_saves_voiceprint_and_login_skips_reenroll(make_test
             "password": "password123",
             "consent_confirmed": "true",
             "consent_ref": "REG-CONSENT-0",
+            "consent_text": "Explicit speaker consent confirmed for voiceprint registration.",
         },
         files={"file": ("short.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     )
@@ -888,6 +930,7 @@ def test_register_with_voice_saves_voiceprint_and_login_skips_reenroll(make_test
             "password": "password123",
             "consent_confirmed": "true",
             "consent_ref": "REG-CONSENT-1",
+            "consent_text": "Explicit speaker consent confirmed for voiceprint registration.",
         },
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
@@ -913,7 +956,12 @@ def test_register_with_voice_saves_voiceprint_and_login_skips_reenroll(make_test
 
     reenroll = client.post(
         "/api/v1/enrollments",
-        data={"subject_ref": subject_ref, "consent_confirmed": "true", "consent_ref": "RETRY"},
+        data={
+            "subject_ref": subject_ref,
+            "consent_confirmed": "true",
+            "consent_ref": "RETRY",
+            "consent_text": "Explicit speaker consent confirmed for re-enrollment.",
+        },
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
     assert reenroll.status_code == 409
@@ -1336,6 +1384,7 @@ def test_server_context_ignores_tampered_after_hours_privileged_and_amount(make_
             "password": "password123",
             "consent_confirmed": "true",
             "consent_ref": "CTX-1",
+            "consent_text": "Explicit speaker consent confirmed for voiceprint registration.",
         },
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
@@ -1444,6 +1493,7 @@ def test_step_up_completion_single_token_double_complete_409_and_banking_thresho
             "password": "password123",
             "consent_confirmed": "true",
             "consent_ref": "BANK-REG-1",
+            "consent_text": "Explicit speaker consent confirmed for voiceprint registration.",
         },
         files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
     )
@@ -1786,3 +1836,373 @@ def test_every_hold_cause_returns_fallbacks_and_asr_down_still_rejects_fake(make
         assert r_q["outcome"] == "REVIEW / HOLD"
         assert r_q["reason_codes"] == ["AUDIO_QUALITY_LOW"]
         assert len(r_q["fallback_options"]) == 3
+
+
+def _transform_wav_gain_and_trim(wav_bytes: bytes, *, gain: float = 0.6, trim_ms: int = 200) -> bytes:
+    """Return a gain-scaled and trimmed PCM WAV copy (breaks exact SHA-256 while preserving spectral identity)."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float64)
+    trim_frames = int((trim_ms / 1000.0) * sr) * ch
+    if trim_frames * 2 < samples.size:
+        samples = samples[trim_frames:-trim_frames]
+    scaled = np.clip(samples * gain, -32767.0, 32767.0).astype("<i2")
+    out = io.BytesIO()
+    with wave.open(out, "wb") as out_wf:
+        out_wf.setnchannels(ch)
+        out_wf.setsampwidth(sw)
+        out_wf.setframerate(sr)
+        out_wf.writeframes(scaled.tobytes())
+    return out.getvalue()
+
+
+def test_perceptual_audio_replay_detects_gain_scaled_and_trimmed_copy(make_test_client):
+    clip_a = make_pcm_wav_bytes(6.0)
+    clip_a_modified = _transform_wav_gain_and_trim(clip_a, gain=0.6, trim_ms=200)
+    clip_b = make_pcm_wav_bytes(6.0)
+
+    h_a = compute_perceptual_hash(clip_a)
+    h_mod = compute_perceptual_hash(clip_a_modified)
+    h_b = compute_perceptual_hash(clip_b)
+    assert h_a is not None and h_mod is not None and h_b is not None
+    assert hashlib.sha256(clip_a).hexdigest() != hashlib.sha256(clip_a_modified).hexdigest()
+    assert hamming_distance_hex(h_a, h_mod) <= MAX_PERCEPTUAL_HAMMING_BITS
+    assert hamming_distance_hex(h_a, h_b) > MAX_PERCEPTUAL_HAMMING_BITS
+
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-PHASH-1")
+
+    s1 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-PHASH-1", "action": "sim_replacement", "resource_ref": "SIM-P1"},
+    ).json()
+    r1 = client.post(
+        f"/api/v1/verification-sessions/{s1['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("orig.wav", clip_a, "audio/wav")},
+    ).json()
+    assert r1["outcome"] == "APPROVED"
+
+    s2 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-PHASH-1", "action": "sim_replacement", "resource_ref": "SIM-P2"},
+    ).json()
+    r2 = client.post(
+        f"/api/v1/verification-sessions/{s2['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("reencoded.wav", clip_a_modified, "audio/wav")},
+    ).json()
+    assert r2["outcome"] == "REJECTED"
+    assert r2["reason_codes"] == ["AUDIO_REPLAY_DETECTED"]
+    assert r2["match_type"] == "perceptual"
+    assert r2["decision_token"] is None
+
+
+def test_multi_segment_verification_and_disagreement_or_segment_fake(make_test_client):
+    verify_calls: list[int] = []
+    mode = {"case": "one_fake"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            idx = len(verify_calls)
+            verify_calls.append(idx)
+            payload = copy.deepcopy(VERIFY_FIXTURE)
+            if mode["case"] == "one_fake" and idx % 2 == 1:
+                payload["deepfake"]["verdict"] = "fake"
+                payload["deepfake"]["is_synthetic"] = True
+            elif mode["case"] == "disagree" and idx % 2 == 1:
+                payload["result"]["decision"] = "no_match"
+                payload["result"]["similarity"] = 0.25
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-MSEC-1")
+
+    # 9s WAV splits into 2 overlapping >=4s slices -> 1 fake slice rejects the whole request
+    s1 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "helpdesk", "subject_ref": "SUB-MSEC-1", "action": "mfa_reset", "resource_ref": "TKT-MS1"},
+    ).json()
+    r1 = client.post(
+        f"/api/v1/verification-sessions/{s1['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("long_fake.wav", make_pcm_wav_bytes(9.0), "audio/wav")},
+    ).json()
+    assert len(verify_calls) == 2
+    assert r1["outcome"] == "REJECTED"
+    assert "DEEPFAKE_SIGNAL" in r1["reason_codes"]
+
+    # Split speaker disagreement (1 match, 1 no_match, both real) -> STEP-UP with second-challenge followup
+    verify_calls.clear()
+    mode["case"] = "disagree"
+    s2 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "helpdesk", "subject_ref": "SUB-MSEC-1", "action": "mfa_reset", "resource_ref": "TKT-MS2"},
+    ).json()
+    r2 = client.post(
+        f"/api/v1/verification-sessions/{s2['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("long_split.wav", make_pcm_wav_bytes(9.0), "audio/wav")},
+    ).json()
+    assert len(verify_calls) == 2
+    assert r2["outcome"] == "STEP-UP"
+    assert r2["reason_codes"] == ["BORDERLINE_SECOND_CHALLENGE"]
+    assert r2["followup_session"] is not None
+    assert r2["followup_session"]["parent_session_id"] == s2["session_id"]
+    assert r2["followup_session"]["challenge_attempt"] == 2
+
+
+def test_borderline_second_challenge_lineage_and_repeated_hold(make_test_client):
+    mode = {"borderline": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            payload = copy.deepcopy(VERIFY_FIXTURE)
+            if mode["borderline"]:
+                payload["result"]["decision"] = "no_match"
+                payload["result"]["similarity"] = 0.49
+                payload["result"]["threshold"] = 0.53  # within BORDERLINE_SIMILARITY_MARGIN (0.08)
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-BORD-1")
+
+    # Attempt 1 borderline -> STEP-UP + followup_session (attempt 2); Attempt 2 also borderline -> REVIEW / HOLD
+    s1 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-BORD-1", "action": "sim_replacement", "resource_ref": "SIM-B1"},
+    ).json()
+    r1 = client.post(
+        f"/api/v1/verification-sessions/{s1['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("b1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r1["outcome"] == "STEP-UP"
+    assert r1["reason_codes"] == ["BORDERLINE_SECOND_CHALLENGE"]
+    followup_id = r1["followup_session"]["session_id"]
+
+    r2 = client.post(
+        f"/api/v1/verification-sessions/{followup_id}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("b2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r2["outcome"] == "REVIEW / HOLD"
+    assert r2["reason_codes"] == ["BORDERLINE_VOICE_HOLD"]
+    assert r2["followup_session"] is None
+    assert len(r2["fallback_options"]) == 3
+
+    # Fresh attempt 1 borderline -> attempt 2 clean match -> APPROVED with token
+    s3 = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-BORD-1", "action": "sim_replacement", "resource_ref": "SIM-B2"},
+    ).json()
+    r3 = client.post(
+        f"/api/v1/verification-sessions/{s3['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("b3.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r3["outcome"] == "STEP-UP"
+    followup_id2 = r3["followup_session"]["session_id"]
+
+    mode["borderline"] = False
+    r4 = client.post(
+        f"/api/v1/verification-sessions/{followup_id2}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("b4.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r4["outcome"] == "APPROVED"
+    assert r4["decision_token"] is not None
+
+
+def test_rate_limiting_and_login_lockout_429_with_audit(make_test_client, db_session_factory, monkeypatch):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    # 1) Verification session rate limit returns 429 + Retry-After + RATE_LIMITED audit row
+    _enroll_subject(client, "SUB-RL-1")
+    monkeypatch.setenv("RL_SESSIONS_PER_MIN", "2")
+    for idx in range(2):
+        ok = client.post(
+            "/api/v1/verification-sessions",
+            json={"sector": "helpdesk", "subject_ref": "SUB-RL-1", "action": "mfa_reset", "resource_ref": f"T-{idx}"},
+        )
+        assert ok.status_code == 200
+    rl_resp = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "helpdesk", "subject_ref": "SUB-RL-1", "action": "mfa_reset", "resource_ref": "T-OVER"},
+    )
+    assert rl_resp.status_code == 429
+    assert int(rl_resp.headers.get("Retry-After", "0")) >= 1
+    assert any("RATE_LIMITED" in a["reason_codes"] for a in client.get("/api/v1/audit").json()["audit_events"])
+
+    # 2) Logout and trigger 5 failed logins -> 6th returns HTTP 429 + Retry-After, and SQLite lock survives in-memory reset
+    client.post("/api/v1/auth/logout")
+    for _ in range(5):
+        resp = client.post("/api/v1/auth/login", json={"username": "lockout.target", "password": "wrong-password"})
+        assert resp.status_code == 401
+
+    locked = client.post("/api/v1/auth/login", json={"username": "lockout.target", "password": "wrong-password"})
+    assert locked.status_code == 429
+    assert int(locked.headers.get("Retry-After", "0")) >= 1
+
+    gateway_rate_limiter.reset()
+    locked_after_restart = client.post(
+        "/api/v1/auth/login",
+        json={"username": "lockout.target", "password": "wrong-password"},
+    )
+    assert locked_after_restart.status_code == 429
+
+    with db_session_factory() as db:
+        audits = db.query(AuditEvent).all()
+        assert any("RATE_LIMITED" in json.loads(a.reason_codes_json) and a.action == "login" for a in audits)
+
+
+def test_enrollment_consent_text_verified_reenroll_and_24h_cooldown(make_test_client, monkeypatch):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    # Registration requires consent_text (min 10 chars)
+    no_consent_text = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "consent.missing",
+            "display_name": "No Consent",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "C-BAD",
+            "consent_text": "short",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert no_consent_text.status_code in (400, 422)
+
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "consent.user",
+            "display_name": "Consent User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "C-OK-1",
+            "consent_text": "I consent to biometric voiceprint storage for identity verification.",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reg.status_code == 200
+    sub = reg.json()["user"]["subject_ref"]
+
+    # Complete a verified APPROVED session for this user
+    ver_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "helpdesk", "subject_ref": sub, "action": "mfa_reset", "resource_ref": "TKT-RE-1"},
+    ).json()
+    ver_res = client.post(
+        f"/api/v1/verification-sessions/{ver_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ok1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert ver_res["outcome"] == "APPROVED"
+
+    # Re-enroll without verified_session_id fails with 409; with verified_session_id succeeds and starts 24h cooldown
+    blocked_reenroll = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": sub,
+            "consent_confirmed": "true",
+            "consent_ref": "C-RE-1",
+            "consent_text": "I explicitly authorize updating my biometric voiceprint.",
+        },
+        files={"file": ("re.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert blocked_reenroll.status_code == 409
+
+    ok_reenroll = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": sub,
+            "consent_confirmed": "true",
+            "consent_ref": "C-RE-2",
+            "consent_text": "I explicitly authorize updating my biometric voiceprint.",
+            "verified_session_id": ver_sess["session_id"],
+        },
+        files={"file": ("re2.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert ok_reenroll.status_code == 200
+    assert ok_reenroll.json()["enrollment"]["re_enrolled_at"] is not None
+
+    # Critical telecom sim_replacement during 24h re-enrollment cooldown -> STEP-UP (NEW_ENROLLMENT_COOLDOWN)
+    cool_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": sub, "action": "sim_replacement", "resource_ref": "SIM-COOL-1"},
+    ).json()
+    cool_res = client.post(
+        f"/api/v1/verification-sessions/{cool_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ok2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert cool_res["outcome"] == "STEP-UP"
+    assert "NEW_ENROLLMENT_COOLDOWN" in cool_res["reason_codes"]
+
+    # DEMO_MODE disables NEW_ENROLLMENT_COOLDOWN for fast testing
+    monkeypatch.setenv("DEMO_MODE", "true")
+    demo_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": sub, "action": "sim_replacement", "resource_ref": "SIM-COOL-2"},
+    ).json()
+    demo_res = client.post(
+        f"/api/v1/verification-sessions/{demo_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ok3.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert demo_res["outcome"] == "APPROVED"
+
+
+def test_tamper_evident_audit_hash_chain_and_detection(make_test_client, db_session_factory):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-CHAIN-1")
+
+    for idx in range(2):
+        s = client.post(
+            "/api/v1/verification-sessions",
+            json={"sector": "telecom", "subject_ref": "SUB-CHAIN-1", "action": "sim_replacement", "resource_ref": f"SIM-C{idx}"},
+        ).json()
+        res = client.post(
+            f"/api/v1/verification-sessions/{s['session_id']}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": (f"c{idx}.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+        ).json()
+        assert res["outcome"] == "APPROVED"
+        last_sid = s["session_id"]
+
+    chain = client.get("/api/v1/audit/verify-chain")
+    assert chain.status_code == 200
+    chain_body = chain.json()
+    assert chain_body["valid"] is True
+    assert chain_body["total_events"] >= 2
+    assert chain_body["first_broken_index"] is None
+
+    dossier = client.get(f"/api/v1/audit/{last_sid}/export").json()
+    assert dossier["audit_chain_status"]["valid"] is True
+
+    # Tamper directly with the first audit row in SQLite -> verify-chain detects exact break
+    with db_session_factory() as db:
+        first_row = db.query(AuditEvent).order_by(AuditEvent.id.asc()).first()
+        assert first_row is not None
+        first_row.outcome = "REJECTED"
+        db.commit()
+
+    broken = client.get("/api/v1/audit/verify-chain").json()
+    assert broken["valid"] is False
+    assert broken["first_broken_index"] == 0
+    assert broken["first_broken_id"] is not None

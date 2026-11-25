@@ -917,7 +917,10 @@
         <div class="card" style="margin-bottom:20px;">
           <div class="card-hdr">
             <div class="card-title"><span class="step-tag">SQLITE</span> Live Audit Timeline</div>
-            <button class="btn btn-ghost btn-sm" onclick="refreshAdminPanels()">Refresh Audit Log</button>
+            <div class="btn-row">
+              <span class="pill ok" id="audit-chain-pill">CHAIN: CHECKING...</span>
+              <button class="btn btn-ghost btn-sm" onclick="refreshAdminPanels()">Refresh Audit Log</button>
+            </div>
           </div>
           <div class="table-wrap">
             <table>
@@ -1108,6 +1111,7 @@
           if (password.length < 6) { setStatus("auth-status", "Password must be at least 6 characters.", "warn"); return; }
           const consentOk = document.getElementById("reg-enroll-consent").checked;
           const consentRef = document.getElementById("reg-enroll-consent-ref").value.trim() || "USER-REG-CONSENT-2026";
+          const consentText = "I consent to saving my voiceprint to this account (SHA-256 & perceptual hash only; zero raw audio stored).";
           if (!consentOk) { setStatus("reg-enroll-status", "Confirm consent to save your voiceprint.", "err"); setStatus("auth-status", "Confirm voiceprint consent before creating account.", "err"); return; }
           if (!state.blobs["reg-enroll"]) { setStatus("reg-enroll-status", "Record or upload a 15–60s WAV file to enroll.", "warn"); setStatus("auth-status", "Capture or upload a 15–60s WAV voiceprint to register.", "warn"); return; }
 
@@ -1117,6 +1121,7 @@
           fd.append("password", password);
           fd.append("consent_confirmed", "true");
           fd.append("consent_ref", consentRef);
+          fd.append("consent_text", consentText);
           fd.append("file", state.blobs["reg-enroll"], state.blobs["reg-enroll"].name || "reg-enroll.wav");
 
           submitBtn.disabled = true;
@@ -1527,14 +1532,22 @@
 
     async function refreshAdminPanels() {
       try {
-        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes] = await Promise.all([
+        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes, chainRes] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/enrollments"),
           apiJson("/api/v1/audit"),
           apiJson("/api/v1/risk-events"),
           apiJson("/api/v1/metrics"),
-          apiJson("/api/v1/admin/review-queue")
+          apiJson("/api/v1/admin/review-queue"),
+          apiJson("/api/v1/audit/verify-chain")
         ]);
+        const chainPill = document.getElementById("audit-chain-pill");
+        if (chainPill) {
+          chainPill.className = "pill " + (chainRes.valid ? "ok" : "bad");
+          chainPill.textContent = chainRes.valid
+            ? `CHAIN VERIFIED (${chainRes.total_events} events)`
+            : `CHAIN BROKEN (#${chainRes.first_broken_index})`;
+        }
         const enrolledCount = String(health.enrolled_count ?? (enrollRes.enrollments || []).length);
         document.getElementById("enrolled-count").textContent = enrolledCount;
         document.getElementById("stat-enrolled").textContent = enrolledCount;
@@ -1688,7 +1701,9 @@
       if (!state.blobs["admin-enroll"]) { setStatus("enroll-status", "Record or upload a 15–60s WAV file first.", "warn"); return; }
       const fd = new FormData();
       fd.append("subject_ref", subjectRef); fd.append("consent_confirmed", "true");
-      fd.append("consent_ref", consentRef); fd.append("file", state.blobs["admin-enroll"], "enroll.wav");
+      fd.append("consent_ref", consentRef);
+      fd.append("consent_text", "Explicit speaker consent obtained (persist SHA-256 & perceptual hash only; never raw audio).");
+      fd.append("file", state.blobs["admin-enroll"], "enroll.wav");
       setStatus("enroll-status", "Enrolling speaker via DetectifAI Eidos...", "");
       try {
         const res = await apiJson("/api/v1/enrollments", { method: "POST", body: fd });

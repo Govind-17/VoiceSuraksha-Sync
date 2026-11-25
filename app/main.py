@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -19,7 +20,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -27,6 +28,12 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.asr import ServerASRAdapter
+from app.audio_fingerprint import (
+    MAX_PERCEPTUAL_HAMMING_BITS,
+    compute_perceptual_hash,
+    hamming_distance_hex,
+    split_wav_segments,
+)
 from app.audio_quality import AudioQualityReport, inspect_pcm_wav_quality
 from app.auth import (
     AuthActor,
@@ -43,7 +50,7 @@ from app.auth import (
     verify_password,
 )
 from app.db import get_db, get_storage_backend, init_db, is_storage_durable
-from app.detectif_client import DetectifClient, DetectifProviderError
+from app.detectif_client import DetectifClient, DetectifProviderError, ProviderVerifyResult
 from app.models import (
     AuditEvent,
     Decision,
@@ -58,10 +65,12 @@ from app.models import (
 )
 from app.policy import (
     GATEWAY_PROFILES,
+    GENESIS_AUDIT_HASH,
     NON_VOICE_FALLBACK_OPTIONS,
     AuthorizationDecision,
     SessionPolicyInput,
     VoiceEvidenceInput,
+    compute_audit_entry_hash,
     evaluate_voice_authorization,
     generate_challenge_phrase,
     hash_text_sha256,
@@ -70,6 +79,7 @@ from app.policy import (
     validate_sector_action,
     verify_phrase_match,
 )
+from app.rate_limit import RateLimitExceeded, gateway_rate_limiter
 
 load_dotenv(override=False)
 
@@ -99,6 +109,110 @@ def _is_subject_privileged(db: Session, subject_ref: str, enrollment: Enrollment
     enr = enrollment or db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
     acct = db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref))
     return bool((enr and enr.privileged_role) or (acct and acct.privileged_role))
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _append_audit_event(
+    db: Session,
+    *,
+    session_id: str,
+    sector: str,
+    action: str,
+    outcome: str,
+    reason_codes: list[str],
+    created_at: datetime | None = None,
+) -> AuditEvent:
+    """Append an AuditEvent chained via prev_hash -> entry_hash (SHA-256)."""
+    ts = _as_utc(created_at or utcnow())
+    last_entry_hash = db.scalar(
+        select(AuditEvent.entry_hash).order_by(AuditEvent.id.desc()).limit(1)
+    )
+    prev_hash = last_entry_hash or GENESIS_AUDIT_HASH
+    entry_hash = compute_audit_entry_hash(
+        prev_hash=prev_hash,
+        session_id=session_id,
+        sector=sector,
+        action=action,
+        outcome=outcome,
+        reason_codes=reason_codes,
+        created_at_iso=ts.isoformat(),
+    )
+    row = AuditEvent(
+        session_id=session_id,
+        sector=sector,
+        action=action,
+        outcome=outcome,
+        reason_codes_json=json.dumps(reason_codes),
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
+        created_at=ts,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _verify_audit_chain(db: Session) -> dict[str, Any]:
+    """Recompute the full AuditEvent hash chain and report first broken index if tampered."""
+    rows = db.scalars(select(AuditEvent).order_by(AuditEvent.id.asc())).all()
+    expected_prev = GENESIS_AUDIT_HASH
+    for idx, row in enumerate(rows):
+        reasons = json.loads(row.reason_codes_json)
+        expected_entry = compute_audit_entry_hash(
+            prev_hash=expected_prev,
+            session_id=row.session_id,
+            sector=row.sector,
+            action=row.action,
+            outcome=row.outcome,
+            reason_codes=reasons,
+            created_at_iso=_as_utc(row.created_at).isoformat(),
+        )
+        if row.prev_hash != expected_prev or row.entry_hash != expected_entry:
+            return {
+                "valid": False,
+                "total_events": len(rows),
+                "first_broken_index": idx,
+                "first_broken_id": row.id,
+                "tip_hash": expected_prev if idx > 0 else None,
+            }
+        expected_prev = row.entry_hash or expected_entry
+    return {
+        "valid": True,
+        "total_events": len(rows),
+        "first_broken_index": None,
+        "first_broken_id": None,
+        "tip_hash": expected_prev if rows else GENESIS_AUDIT_HASH,
+    }
+
+
+def _raise_rate_limited(
+    db: Session,
+    *,
+    exc: RateLimitExceeded,
+    session_id: str,
+    sector: str,
+    action: str,
+) -> None:
+    _append_audit_event(
+        db,
+        session_id=session_id,
+        sector=sector,
+        action=action,
+        outcome="REJECTED",
+        reason_codes=["RATE_LIMITED", exc.bucket],
+    )
+    db.commit()
+    raise HTTPException(
+        status_code=429,
+        detail=exc.detail,
+        headers={"Retry-After": str(exc.retry_after)},
+    )
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -278,9 +392,11 @@ def _enrollment_payload(record: Enrollment, duration_seconds: float | None = Non
         "subject_ref": record.subject_ref,
         "provider_speaker_id": record.provider_speaker_id,
         "consent_ref": record.consent_ref,
+        "consent_text": record.consent_text,
         "audio_sha256": record.audio_sha256,
         "speech_seconds": record.speech_seconds,
         "created_at": _as_utc(record.created_at).isoformat(),
+        "re_enrolled_at": _as_utc(record.re_enrolled_at).isoformat() if record.re_enrolled_at else None,
     }
     if duration_seconds is not None:
         payload["duration_seconds"] = duration_seconds
@@ -368,6 +484,7 @@ async def auth_register_with_voice(
     password: str = Form(..., min_length=6, max_length=128),
     consent_confirmed: bool = Form(...),
     consent_ref: str = Form("USER-REG-CONSENT-2026", min_length=2, max_length=128),
+    consent_text: str = Form(..., min_length=10, max_length=512),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
@@ -375,10 +492,13 @@ async def auth_register_with_voice(
     """Register a new end-user account AND enroll their voiceprint atomically."""
     clean_username = username.strip().lower()
     clean_display = display_name.strip()
+    clean_consent_text = consent_text.strip()
     if len(clean_username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
     if len(clean_display) < 2:
         raise HTTPException(status_code=400, detail="Full name must be at least 2 characters.")
+    if len(clean_consent_text) < 10:
+        raise HTTPException(status_code=400, detail="Explicit consent_text (min 10 chars) is required.")
 
     admin_user, _ = get_admin_credentials()
     if clean_username == admin_user.lower():
@@ -398,6 +518,7 @@ async def auth_register_with_voice(
     )
 
     audio_digest = hashlib.sha256(wav_bytes).hexdigest()
+    perceptual_digest = compute_perceptual_hash(wav_bytes)
     account = UserAccount(
         username=clean_username,
         display_name=clean_display,
@@ -408,6 +529,7 @@ async def auth_register_with_voice(
         subject_ref=subject_ref,
         provider_speaker_id=provider_res.speaker_id,
         consent_ref=consent_ref,
+        consent_text=clean_consent_text,
         audio_sha256=audio_digest,
         speech_seconds=provider_res.speech_seconds,
     )
@@ -418,6 +540,7 @@ async def auth_register_with_voice(
             session_id=None,
             event_kind="enroll",
             audio_sha256=audio_digest,
+            perceptual_hash=perceptual_digest,
             credits_balance=provider_res.credits_balance,
         )
     )
@@ -442,14 +565,22 @@ async def auth_register_with_voice(
 @app.post("/api/v1/auth/login")
 def auth_login(
     body: LoginRequest,
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Authenticate an admin or registered user and issue an HttpOnly session cookie."""
+    """Authenticate an admin or registered user with per-IP/per-user lockout protection."""
     clean_username = body.username.strip()
-    admin_user, admin_pass = get_admin_credentials()
+    ip = _client_ip(request)
+    try:
+        gateway_rate_limiter.ensure_login_allowed(db, ip=ip, username=clean_username)
+    except RateLimitExceeded as exc:
+        _raise_rate_limited(db, exc=exc, session_id=f"auth-{ip}", sector="auth", action="login")
 
-    if clean_username == admin_user and secrets.compare_digest(body.password, admin_pass):
+    admin_user, admin_pass = get_admin_credentials()
+    if clean_username == admin_user and secrets.compare_digest(body.password.encode("utf-8"), admin_pass.encode("utf-8")):
+        gateway_rate_limiter.clear_login_failures(db, ip=ip, username=clean_username)
+        db.commit()
         actor = AuthActor(
             username=admin_user,
             role="admin",
@@ -461,8 +592,12 @@ def auth_login(
 
     account = db.scalar(select(UserAccount).where(UserAccount.username == clean_username.lower()))
     if account is None or not verify_password(body.password, account.password_hash):
+        gateway_rate_limiter.record_login_failure(db, ip=ip, username=clean_username)
+        db.commit()
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
+    gateway_rate_limiter.clear_login_failures(db, ip=ip, username=clean_username)
+    db.commit()
     actor = AuthActor(
         username=account.username,
         role="user",
@@ -587,7 +722,7 @@ def list_audit(
     db: Session = Depends(get_db),
     _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
-    """List immutable audit trail records (admin only)."""
+    """List immutable tamper-evident audit trail records (admin only)."""
     rows = db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc())).all()
     return {
         "audit_events": [
@@ -598,11 +733,22 @@ def list_audit(
                 "action": r.action,
                 "outcome": r.outcome,
                 "reason_codes": json.loads(r.reason_codes_json),
+                "prev_hash": r.prev_hash,
+                "entry_hash": r.entry_hash,
                 "created_at": _as_utc(r.created_at).isoformat(),
             }
             for r in rows
         ]
     }
+
+
+@app.get("/api/v1/audit/verify-chain")
+def verify_audit_chain(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Verify SHA-256 tamper-evident AuditEvent hash chain integrity (admin only)."""
+    return _verify_audit_chain(db)
 
 
 def _emit_signed_risk_event(
@@ -714,15 +860,14 @@ def resolve_risk_event(
     now = utcnow()
     note = body.resolution_note.strip() if body else "Resolved by SOC administrator"
     risk_row.risk_state = "RESOLVED"
-    db.add(
-        AuditEvent(
-            session_id=risk_row.source_case_ref,
-            sector=risk_row.source_sector,
-            action="risk_alert_resolve",
-            outcome="APPROVED",
-            reason_codes_json=json.dumps(["RISK_ALERT_RESOLVED"]),
-            created_at=now,
-        )
+    _append_audit_event(
+        db,
+        session_id=risk_row.source_case_ref,
+        sector=risk_row.source_sector,
+        action="risk_alert_resolve",
+        outcome="APPROVED",
+        reason_codes=["RISK_ALERT_RESOLVED"],
+        created_at=now,
     )
     db.commit()
     return {
@@ -784,15 +929,14 @@ def trigger_offline_swap_callback(
         amount_inr=None,
     )
     db.add(session)
-    db.add(
-        AuditEvent(
-            session_id=session_id,
-            sector="telecom",
-            action="sim_replacement",
-            outcome="STEP-UP",
-            reason_codes_json=json.dumps(["OFFLINE_RETAIL_SIM_SWAP", "CALLBACK_TRIGGERED"]),
-            created_at=now,
-        )
+    _append_audit_event(
+        db,
+        session_id=session_id,
+        sector="telecom",
+        action="sim_replacement",
+        outcome="STEP-UP",
+        reason_codes=["OFFLINE_RETAIL_SIM_SWAP", "CALLBACK_TRIGGERED"],
+        created_at=now,
     )
     db.commit()
     db.refresh(session)
@@ -818,18 +962,49 @@ async def create_enrollment(
     subject_ref: str = Form(..., min_length=2, max_length=64),
     consent_confirmed: bool = Form(...),
     consent_ref: str = Form(..., min_length=2, max_length=128),
+    consent_text: str = Form(..., min_length=10, max_length=512),
+    verified_session_id: str | None = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
     actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
-    """Enroll a consented speaker voiceprint via Eidos; store SHA-256 hash only."""
+    """Enroll or re-enroll a consented speaker voiceprint via Eidos; store SHA-256 + perceptual hash only."""
     if actor.role != "admin" and subject_ref != actor.subject_ref:
         raise HTTPException(status_code=403, detail="Users may only enroll their own assigned subject_ref.")
 
+    clean_consent_text = consent_text.strip()
+    if len(clean_consent_text) < 10:
+        raise HTTPException(status_code=400, detail="Explicit consent_text (min 10 chars) is required.")
+
+    try:
+        gateway_rate_limiter.check_sliding_limit(
+            db,
+            key=f"enroll_sub:{subject_ref}",
+            limit=gateway_rate_limiter._env_int("RL_ENROLL_PER_HOUR", 20),
+            window_seconds=3600,
+            detail="Enrollment rate limit exceeded for this subject.",
+        )
+    except RateLimitExceeded as exc:
+        _raise_rate_limited(db, exc=exc, session_id=f"enroll-{subject_ref}", sector="enrollment", action="enroll")
+
     existing = db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
-    if actor.role != "admin" and existing is not None:
-        raise HTTPException(status_code=409, detail="Voiceprint is already enrolled for this account.")
+    if existing is not None and actor.role != "admin":
+        verified_ok = False
+        if verified_session_id:
+            ver_sess = db.scalar(
+                select(VerificationSession).where(
+                    VerificationSession.session_id == verified_session_id,
+                    VerificationSession.subject_ref == subject_ref,
+                    VerificationSession.status == "APPROVED",
+                )
+            )
+            verified_ok = ver_sess is not None
+        if not verified_ok:
+            raise HTTPException(
+                status_code=409,
+                detail="Voiceprint is already enrolled for this account; re-enrollment requires an APPROVED verified session or admin approval.",
+            )
 
     wav_bytes, provider_res = await _validate_and_enroll_wav(
         subject_ref=subject_ref,
@@ -838,18 +1013,23 @@ async def create_enrollment(
         client=client,
     )
 
+    now = utcnow()
     audio_digest = hashlib.sha256(wav_bytes).hexdigest()
+    perceptual_digest = compute_perceptual_hash(wav_bytes)
     if existing is not None:
         existing.provider_speaker_id = provider_res.speaker_id
         existing.consent_ref = consent_ref
+        existing.consent_text = clean_consent_text
         existing.audio_sha256 = audio_digest
         existing.speech_seconds = provider_res.speech_seconds
+        existing.re_enrolled_at = now
         record = existing
     else:
         record = Enrollment(
             subject_ref=subject_ref,
             provider_speaker_id=provider_res.speaker_id,
             consent_ref=consent_ref,
+            consent_text=clean_consent_text,
             audio_sha256=audio_digest,
             speech_seconds=provider_res.speech_seconds,
         )
@@ -860,6 +1040,7 @@ async def create_enrollment(
             session_id=None,
             event_kind="enroll",
             audio_sha256=audio_digest,
+            perceptual_hash=perceptual_digest,
             credits_balance=provider_res.credits_balance,
         )
     )
@@ -894,6 +1075,30 @@ def create_verification_session(
     enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == body.subject_ref))
     if enrollment is None:
         raise HTTPException(status_code=404, detail=f"Subject '{body.subject_ref}' is not enrolled.")
+
+    try:
+        gateway_rate_limiter.check_sliding_limit(
+            db,
+            key=f"sess_sub:{body.subject_ref}",
+            limit=gateway_rate_limiter._env_int("RL_SESSIONS_PER_MIN", 30),
+            window_seconds=60,
+            detail="Verification session rate limit exceeded for subject.",
+        )
+        gateway_rate_limiter.check_sliding_limit(
+            db,
+            key=f"sess_caller:{actor.username}",
+            limit=gateway_rate_limiter._env_int("RL_CALLER_SESSIONS_PER_MIN", 40),
+            window_seconds=60,
+            detail="Verification session rate limit exceeded for caller.",
+        )
+    except RateLimitExceeded as exc:
+        _raise_rate_limited(
+            db,
+            exc=exc,
+            session_id=f"sess-limit-{body.subject_ref}",
+            sector=body.sector,
+            action=body.action,
+        )
 
     now = utcnow()
     session_id = str(uuid.uuid4())
@@ -953,10 +1158,35 @@ async def submit_verification_audio(
     if session.status != "PENDING":
         raise HTTPException(status_code=409, detail=f"Session '{session_id}' has already been processed ({session.status}).")
 
+    try:
+        gateway_rate_limiter.check_sliding_limit(
+            db,
+            key=f"audio_sub:{session.subject_ref}",
+            limit=gateway_rate_limiter._env_int("RL_AUDIO_PER_MIN", 30),
+            window_seconds=60,
+            detail="Audio verification rate limit exceeded for subject.",
+        )
+        gateway_rate_limiter.check_sliding_limit(
+            db,
+            key=f"audio_caller:{actor.username}",
+            limit=gateway_rate_limiter._env_int("RL_CALLER_AUDIO_PER_MIN", 40),
+            window_seconds=60,
+            detail="Audio verification rate limit exceeded for caller.",
+        )
+    except RateLimitExceeded as exc:
+        _raise_rate_limited(
+            db,
+            exc=exc,
+            session_id=session.session_id,
+            sector=session.sector,
+            action=session.action,
+        )
+
     now = utcnow()
     wav_bytes = await _read_bounded_wav(file)
     wav_duration = _inspect_wav_duration(wav_bytes) if wav_bytes else None
     audio_digest = hashlib.sha256(wav_bytes).hexdigest() if wav_bytes else None
+    perceptual_digest = compute_perceptual_hash(wav_bytes) if wav_bytes else None
 
     action_meta = validate_sector_action(session.sector, session.action)
     is_critical = bool(action_meta.get("critical", False))
@@ -972,28 +1202,34 @@ async def submit_verification_audio(
 
     is_expired = now > _as_utc(session.expires_at)
 
-    replayed_telemetry = (
-        db.scalar(
-            select(VerificationTelemetry)
-            .where(
+    replay_match_type: str | None = None
+    if not is_expired and (audio_digest or perceptual_digest):
+        prior_verifies = db.scalars(
+            select(VerificationTelemetry).where(
                 VerificationTelemetry.event_kind == "verify",
-                VerificationTelemetry.audio_sha256 == audio_digest,
                 VerificationTelemetry.session_id != session.session_id,
             )
-            .limit(1)
-        )
-        if (not is_expired and audio_digest)
-        else None
-    )
+        ).all()
+        for prev in prior_verifies:
+            if audio_digest and prev.audio_sha256 == audio_digest:
+                replay_match_type = "exact"
+                break
+            if (
+                perceptual_digest
+                and prev.perceptual_hash
+                and hamming_distance_hex(perceptual_digest, prev.perceptual_hash) <= MAX_PERCEPTUAL_HAMMING_BITS
+            ):
+                replay_match_type = "perceptual"
+                break
 
     quality_report: AudioQualityReport | None = None
-    if replayed_telemetry is None and not is_expired and wav_bytes and (wav_duration is None or wav_duration >= 4.0):
+    if replay_match_type is None and not is_expired and wav_bytes and (wav_duration is None or wav_duration >= 4.0):
         quality_report = inspect_pcm_wav_quality(wav_bytes)
     quality_failed = bool(quality_report is not None and quality_report.valid_wav and not quality_report.passed)
 
     asr_available = True
     effective_transcript = ""
-    if not is_expired and replayed_telemetry is None and not quality_failed:
+    if not is_expired and replay_match_type is None and not quality_failed:
         if demo_mode and spoken_transcript.strip():
             effective_transcript = spoken_transcript
             asr_available = True
@@ -1008,37 +1244,86 @@ async def submit_verification_audio(
     phrase_blocked_before_provider = require_phrase and asr_available and not phrase_match
     should_call_provider = (
         not is_expired
-        and replayed_telemetry is None
+        and replay_match_type is None
         and not quality_failed
         and not phrase_blocked_before_provider
     )
 
-    provider_res = None
+    provider_res: ProviderVerifyResult | None = None
     provider_error: str | None = None
+    segment_disagreement = False
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
 
     if should_call_provider:
-        enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
         if enrollment is None:
             provider_error = "enrollment_missing"
         elif wav_duration is not None and wav_duration < 4.0:
             # Avoid calling combined deepfake verification on <4s clips; treat as INCONCLUSIVE_EVIDENCE.
             provider_error = None
         else:
+            wav_segments = split_wav_segments(wav_bytes)
             try:
-                provider_res = client.verify_with_deepfake(
-                    speaker_id=enrollment.provider_speaker_id,
-                    wav_bytes=wav_bytes,
-                )
+                if len(wav_segments) <= 1:
+                    provider_res = client.verify_with_deepfake(
+                        speaker_id=enrollment.provider_speaker_id,
+                        wav_bytes=wav_segments[0],
+                    )
+                else:
+                    seg_results = await asyncio.gather(
+                        *(
+                            asyncio.to_thread(
+                                client.verify_with_deepfake,
+                                enrollment.provider_speaker_id,
+                                seg_wav,
+                            )
+                            for seg_wav in wav_segments
+                        )
+                    )
+                    match_cnt = sum(1 for r in seg_results if r.speaker_decision == "match")
+                    majority_match = match_cnt > (len(seg_results) / 2.0)
+                    segment_disagreement = 0 < match_cnt < len(seg_results)
+                    any_fake = any(r.deepfake_verdict == "fake" for r in seg_results)
+                    all_segments: list[dict[str, Any]] = []
+                    for r in seg_results:
+                        all_segments.extend(r.deepfake_segments or [])
+                    sims = [r.speaker_similarity for r in seg_results]
+                    df_scores = [r.deepfake_score for r in seg_results if r.deepfake_score is not None]
+                    lats = [r.latency_ms for r in seg_results if r.latency_ms is not None]
+                    first = seg_results[0]
+                    provider_res = ProviderVerifyResult(
+                        request_id=first.request_id,
+                        operation_id=first.operation_id,
+                        speaker_id=first.speaker_id,
+                        speaker_decision="match" if majority_match else "no_match",
+                        speaker_similarity=float(statistics.median(sims)),
+                        speaker_threshold=first.speaker_threshold,
+                        duration_seconds=wav_duration or first.duration_seconds,
+                        deepfake_verdict="fake" if any_fake else "real",
+                        deepfake_is_synthetic=any_fake,
+                        deepfake_score=max(df_scores) if df_scores else first.deepfake_score,
+                        deepfake_threshold=first.deepfake_threshold,
+                        deepfake_segments=all_segments,
+                        latency_ms=max(lats) if lats else first.latency_ms,
+                        credits_balance=seg_results[-1].credits_balance,
+                    )
             except DetectifProviderError as exc:
                 provider_error = exc.error_code
 
-    if replayed_telemetry is not None:
+    cooldown_hours = gateway_rate_limiter._env_int("NEW_ENROLLMENT_COOLDOWN_HOURS", 24)
+    in_reenroll_cooldown = (
+        not demo_mode
+        and enrollment is not None
+        and enrollment.re_enrolled_at is not None
+        and (_as_utc(enrollment.re_enrolled_at) + timedelta(hours=cooldown_hours)) > now
+    )
+
+    if replay_match_type is not None:
         evaluation = AuthorizationDecision(
             outcome="REJECTED",
             evidence_state="REPLAY_DETECTED",
             reason_codes=["AUDIO_REPLAY_DETECTED"],
             next_step_script=(
-                "Request rejected: identical verification WAV audio was already submitted in a prior session."
+                f"Request rejected: verification audio matched prior {replay_match_type} replay fingerprint."
             ),
             emit_risk_alert=(session.sector == "telecom" and is_critical),
         )
@@ -1062,6 +1347,9 @@ async def submit_verification_audio(
                     deepfake_verdict=provider_res.deepfake_verdict,
                     duration_seconds=provider_res.duration_seconds,
                     provider_error=None,
+                    speaker_similarity=provider_res.speaker_similarity,
+                    speaker_threshold=provider_res.speaker_threshold,
+                    segment_disagreement=segment_disagreement,
                 )
             else:
                 voice_input = VoiceEvidenceInput(
@@ -1081,6 +1369,8 @@ async def submit_verification_audio(
             expired=is_expired,
             require_phrase_match=require_phrase,
             asr_available=asr_available,
+            challenge_attempt=session.challenge_attempt,
+            new_enrollment_cooldown=in_reenroll_cooldown,
         )
         evaluation = evaluate_voice_authorization(
             session=policy_session,
@@ -1146,20 +1436,51 @@ async def submit_verification_audio(
             demo_flag=True,
         )
 
-    audit_row = AuditEvent(
+    followup_session_payload: dict[str, Any] | None = None
+    if evaluation.outcome == "STEP-UP" and "BORDERLINE_SECOND_CHALLENGE" in evaluation.reason_codes:
+        followup_id = str(uuid.uuid4())
+        followup_phrase = generate_challenge_phrase(session.sector, session.action, session.resource_ref)
+        followup_exp = now + timedelta(minutes=SESSION_TTL_MINUTES)
+        followup_row = VerificationSession(
+            session_id=followup_id,
+            sector=session.sector,
+            subject_ref=session.subject_ref,
+            action=session.action,
+            resource_ref=session.resource_ref,
+            challenge_text=followup_phrase,
+            challenge_hash=hash_text_sha256(normalize_transcript(followup_phrase)),
+            expires_at=followup_exp,
+            status="PENDING",
+            after_hours=session.after_hours,
+            privileged_role=session.privileged_role,
+            amount_inr=session.amount_inr,
+            parent_session_id=session.session_id,
+            challenge_attempt=session.challenge_attempt + 1,
+        )
+        db.add(followup_row)
+        followup_session_payload = {
+            "session_id": followup_id,
+            "parent_session_id": session.session_id,
+            "challenge_attempt": followup_row.challenge_attempt,
+            "challenge_text": followup_phrase,
+            "expires_at": followup_exp.isoformat(),
+        }
+
+    _append_audit_event(
+        db,
         session_id=session.session_id,
         sector=session.sector,
         action=session.action,
         outcome=evaluation.outcome,
-        reason_codes_json=json.dumps(evaluation.reason_codes),
+        reason_codes=evaluation.reason_codes,
         created_at=now,
     )
-    db.add(audit_row)
     db.add(
         VerificationTelemetry(
             session_id=session.session_id,
             event_kind="verify",
             audio_sha256=audio_digest,
+            perceptual_hash=perceptual_digest,
             credits_balance=provider_res.credits_balance if provider_res else None,
         )
     )
@@ -1189,6 +1510,8 @@ async def submit_verification_audio(
             "evidence_state": evaluation.evidence_state,
             "outcome": evaluation.outcome,
             "reason_codes": evaluation.reason_codes,
+            "match_type": replay_match_type,
+            "followup_session": followup_session_payload,
             "next_step_script": evaluation.next_step_script,
             "fallback_options": fallback_options,
             "audio_quality": quality_payload,
@@ -1206,6 +1529,8 @@ async def submit_verification_audio(
         "evidence_state": evaluation.evidence_state,
         "outcome": evaluation.outcome,
         "reason_codes": evaluation.reason_codes,
+        "match_type": replay_match_type,
+        "followup_session": followup_session_payload,
         "next_step_script": evaluation.next_step_script,
         "fallback_options": fallback_options,
         "audio_quality": quality_payload,
@@ -1260,15 +1585,14 @@ def consume_decision_token(
         raise HTTPException(status_code=403, detail="Invalid decision token.")
 
     decision.consumed_at = now
-    db.add(
-        AuditEvent(
-            session_id=session.session_id,
-            sector=session.sector,
-            action=session.action,
-            outcome="APPROVED",
-            reason_codes_json=json.dumps(["TOKEN_CONSUMED", "ACTION_RELEASED"]),
-            created_at=now,
-        )
+    _append_audit_event(
+        db,
+        session_id=session.session_id,
+        sector=session.sector,
+        action=session.action,
+        outcome="APPROVED",
+        reason_codes=["TOKEN_CONSUMED", "ACTION_RELEASED"],
+        created_at=now,
     )
     db.commit()
 
@@ -1334,15 +1658,14 @@ def complete_step_up(
                 f"Amount INR {effective_amount:,.0f} exceeds INR {thresh:,.0f} high-value threshold: "
                 "complete step-up using simulated manager_callback or in_store_kyc."
             )
-            db.add(
-                AuditEvent(
-                    session_id=session.session_id,
-                    sector=session.sector,
-                    action=session.action,
-                    outcome="STEP-UP",
-                    reason_codes_json=json.dumps(["HIGH_VALUE_THRESHOLD_EVALUATED", "HIGH_VALUE_STEP_UP"]),
-                    created_at=now,
-                )
+            _append_audit_event(
+                db,
+                session_id=session.session_id,
+                sector=session.sector,
+                action=session.action,
+                outcome="STEP-UP",
+                reason_codes=["HIGH_VALUE_THRESHOLD_EVALUATED", "HIGH_VALUE_STEP_UP"],
+                created_at=now,
             )
             db.commit()
             return {
@@ -1372,15 +1695,14 @@ def complete_step_up(
     )
     session.status = "APPROVED"
 
-    db.add(
-        AuditEvent(
-            session_id=session.session_id,
-            sector=session.sector,
-            action=session.action,
-            outcome="APPROVED",
-            reason_codes_json=json.dumps(["STEP_UP_COMPLETED", f"METHOD_{body.method.upper()}", "SIMULATED_CHANNEL"]),
-            created_at=now,
-        )
+    _append_audit_event(
+        db,
+        session_id=session.session_id,
+        sector=session.sector,
+        action=session.action,
+        outcome="APPROVED",
+        reason_codes=["STEP_UP_COMPLETED", f"METHOD_{body.method.upper()}", "SIMULATED_CHANNEL"],
+        created_at=now,
     )
     db.commit()
 
@@ -1472,15 +1794,14 @@ def review_held_decision(
     decision.reason_codes_json = json.dumps([*existing_reasons, audit_code])
     decision.next_step_script = f"Reviewer ({admin.username}) recorded {body.decision}: {clean_reason}"
 
-    db.add(
-        AuditEvent(
-            session_id=session.session_id,
-            sector=session.sector,
-            action=session.action,
-            outcome=body.decision,
-            reason_codes_json=json.dumps([audit_code, f"REASON:{clean_reason[:80]}"]),
-            created_at=now,
-        )
+    _append_audit_event(
+        db,
+        session_id=session.session_id,
+        sector=session.sector,
+        action=session.action,
+        outcome=body.decision,
+        reason_codes=[audit_code, f"REASON:{clean_reason[:80]}"],
+        created_at=now,
     )
     db.commit()
 
@@ -1585,6 +1906,7 @@ def export_audit_dossier(
         "exported_at": now.isoformat(),
         "zero_raw_audio_stored": True,
         "sandbox_test": is_sandbox,
+        "audit_chain_status": _verify_audit_chain(db),
         "session": {
             "session_id": session.session_id,
             "sector": session.sector,
@@ -1852,15 +2174,15 @@ def run_redteam_sandbox(
     db.flush()
     db.add(dec)
 
-    audit_row = AuditEvent(
+    audit_row = _append_audit_event(
+        db,
         session_id=sess.session_id,
         sector=sess.sector,
         action=sess.action,
         outcome=outcome,
-        reason_codes_json=json.dumps(reason_codes),
+        reason_codes=reason_codes,
         created_at=now,
     )
-    db.add(audit_row)
     db.commit()
     db.refresh(audit_row)
 

@@ -25,9 +25,11 @@ class Enrollment(Base):
     subject_ref: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     provider_speaker_id: Mapped[str] = mapped_column(String(128), nullable=False)
     consent_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    consent_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     audio_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     speech_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     privileged_role: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    re_enrolled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -48,6 +50,8 @@ class VerificationSession(Base):
     after_hours: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     privileged_role: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     amount_inr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    parent_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    challenge_attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
 
 class VoiceResult(Base):
@@ -109,7 +113,7 @@ class RiskEvent(Base):
 
 
 class AuditEvent(Base):
-    """Immutable audit trail entry (metadata and reason codes only, never raw audio)."""
+    """Immutable tamper-evident audit trail entry linked via SHA-256 hash chain."""
 
     __tablename__ = "audit_events"
 
@@ -119,6 +123,8 @@ class AuditEvent(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_codes_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    entry_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -137,7 +143,7 @@ class UserAccount(Base):
 
 
 class VerificationTelemetry(Base):
-    """Additive telemetry log for audio SHA-256 digests and provider credit balances (zero raw audio)."""
+    """Additive telemetry log for audio SHA-256/perceptual hashes and provider credits (zero raw audio)."""
 
     __tablename__ = "verification_telemetry"
 
@@ -145,6 +151,7 @@ class VerificationTelemetry(Base):
     session_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     event_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     audio_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    perceptual_hash: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     credits_balance: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
@@ -169,3 +176,15 @@ class SchemaVersion(Base):
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     description: Mapped[str] = mapped_column(String(256), nullable=False)
     applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class RateLimitCounter(Base):
+    """DB-backed rate-limit and lockout persistence."""
+
+    __tablename__ = "rate_limit_counters"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

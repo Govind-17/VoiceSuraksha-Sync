@@ -16,6 +16,8 @@ from app.auth import is_demo_mode, is_weak_secret
 _EPHEMERAL_DEMO_WEBHOOK_SECRET = secrets.token_urlsafe(32)
 
 CANONICAL_OUTCOMES = ("APPROVED", "STEP-UP", "REVIEW / HOLD", "REJECTED")
+BORDERLINE_SIMILARITY_MARGIN = 0.08
+GENESIS_AUDIT_HASH = "0" * 64
 
 NON_VOICE_FALLBACK_OPTIONS: list[dict[str, Any]] = [
     {
@@ -148,6 +150,9 @@ class VoiceEvidenceInput:
     deepfake_verdict: str | None = None
     duration_seconds: float | None = None
     provider_error: str | None = None
+    speaker_similarity: float | None = None
+    speaker_threshold: float | None = None
+    segment_disagreement: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,8 @@ class SessionPolicyInput:
     expired: bool = False
     require_phrase_match: bool = False
     asr_available: bool = True
+    challenge_attempt: int = 1
+    new_enrollment_cooldown: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +262,33 @@ def verify_risk_event_signature(payload: dict[str, Any], signature: str, secret:
     """Verify an HMAC-SHA256 webhook signature in constant time."""
     expected = sign_risk_event_payload(payload, secret=secret)
     return hmac.compare_digest(expected, str(signature or ""))
+
+
+def compute_audit_entry_hash(
+    *,
+    prev_hash: str,
+    session_id: str,
+    sector: str,
+    action: str,
+    outcome: str,
+    reason_codes: list[str],
+    created_at_iso: str,
+) -> str:
+    """Compute canonical SHA-256 audit hash chained onto prev_hash."""
+    canonical = json.dumps(
+        {
+            "prev_hash": prev_hash,
+            "session_id": session_id,
+            "sector": sector,
+            "action": action,
+            "outcome": outcome,
+            "reason_codes": reason_codes,
+            "created_at": created_at_iso,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hash_text_sha256(canonical)
 
 
 def verify_phrase_match(challenge_text: str, spoken_transcript: str) -> bool:
@@ -359,6 +393,36 @@ def evaluate_voice_authorization(
             emit_risk_alert=(session.sector == "telecom" and critical_action),
         )
 
+    # Borderline similarity or segment disagreement -> second-challenge STEP-UP on attempt 1, REVIEW / HOLD if repeated
+    is_borderline = (
+        not speaker_match
+        and voice_result.speaker_similarity is not None
+        and voice_result.speaker_threshold is not None
+        and 0.0 < (voice_result.speaker_threshold - voice_result.speaker_similarity) <= BORDERLINE_SIMILARITY_MARGIN
+    )
+    if voice_result.segment_disagreement or is_borderline:
+        if session.challenge_attempt <= 1:
+            return AuthorizationDecision(
+                outcome="STEP-UP",
+                evidence_state="BORDERLINE_VOICE",
+                reason_codes=["BORDERLINE_SECOND_CHALLENGE"],
+                next_step_script=(
+                    "Borderline voice similarity or segment disagreement detected. Issue a fresh second challenge "
+                    "for this session lineage to re-verify before deciding."
+                ),
+                emit_risk_alert=False,
+            )
+        return AuthorizationDecision(
+            outcome="REVIEW / HOLD",
+            evidence_state="INCONCLUSIVE_EVIDENCE",
+            reason_codes=["BORDERLINE_VOICE_HOLD"],
+            next_step_script=(
+                "Second voice challenge remained borderline or inconsistent. Routing to REVIEW / HOLD "
+                "with Non-Voice Accessibility Fallback."
+            ),
+            emit_risk_alert=False,
+        )
+
     # Matrix row: real audio, speaker did not match enrolled voiceprint
     if not speaker_match:
         reasons = ["SPEAKER_NO_MATCH"]
@@ -404,6 +468,8 @@ def evaluate_voice_authorization(
     step_up_reasons: list[str] = []
     if has_cross_domain_alert:
         step_up_reasons.append("CROSS_DOMAIN_ALERT")
+    if session.new_enrollment_cooldown and critical_action:
+        step_up_reasons.append("NEW_ENROLLMENT_COOLDOWN")
     if session.sector == "helpdesk" and session.privileged_role:
         step_up_reasons.append("PRIVILEGED_APPROVAL_REQUIRED")
     if session.sector == "telecom" and session.after_hours:

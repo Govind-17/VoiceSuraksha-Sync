@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def get_database_url() -> str:
@@ -76,17 +76,37 @@ def run_schema_migrations(target_engine=None) -> None:
     inspector = inspect(eng)
     is_postgres = eng.dialect.name == "postgresql"
     bool_default = "FALSE" if is_postgres else "0"
+    ts_type = "TIMESTAMP WITH TIME ZONE" if is_postgres else "DATETIME"
+
+    migrations: dict[str, list[tuple[str, str]]] = {
+        "enrollments": [
+            ("privileged_role", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
+            ("consent_text", "TEXT NOT NULL DEFAULT ''"),
+            ("re_enrolled_at", f"{ts_type}"),
+        ],
+        "user_accounts": [
+            ("privileged_role", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
+        ],
+        "verification_sessions": [
+            ("parent_session_id", "VARCHAR(64)"),
+            ("challenge_attempt", "INTEGER NOT NULL DEFAULT 1"),
+        ],
+        "verification_telemetry": [
+            ("perceptual_hash", "VARCHAR(32)"),
+        ],
+        "audit_events": [
+            ("prev_hash", "VARCHAR(64)"),
+            ("entry_hash", "VARCHAR(64)"),
+        ],
+    }
 
     with eng.begin() as conn:
-        for table_name in ("enrollments", "user_accounts"):
+        for table_name, col_specs in migrations.items():
             if inspector.has_table(table_name):
-                cols = {c["name"] for c in inspector.get_columns(table_name)}
-                if "privileged_role" not in cols:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE {table_name} ADD COLUMN privileged_role BOOLEAN NOT NULL DEFAULT {bool_default}"
-                        )
-                    )
+                existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
+                for col_name, col_ddl in col_specs:
+                    if col_name not in existing_cols:
+                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"))
 
         existing = conn.execute(
             text("SELECT version FROM schema_version WHERE version = :ver"),
@@ -100,7 +120,7 @@ def run_schema_migrations(target_engine=None) -> None:
                 ),
                 {
                     "ver": CURRENT_SCHEMA_VERSION,
-                    "desc": "Add privileged_role subject attributes and schema_version tracking",
+                    "desc": "Add perceptual hash, session lineage, enrollment cooldown, and audit chain columns",
                 },
             )
 
