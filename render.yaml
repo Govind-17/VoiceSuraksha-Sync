@@ -15,6 +15,8 @@ services:
         value: "https://platform.detectif.ai"
       - key: DEMO_MODE
         value: "false"
+      - key: DATABASE_URL
+        sync: false
       - key: VOICESURAKSHA_DB_URL
         value: "sqlite:///./voicesuraksha.db"
       - key: ADMIN_USERNAME
@@ -29,3 +31,5 @@ services:
         value: "sarvam"
       - key: ASR_API_KEY
         sync: false
+      - key: ASR_LANGUAGE_CODE
+        value: "en-IN"

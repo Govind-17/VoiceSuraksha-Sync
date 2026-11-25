@@ -2405,3 +2405,213 @@ def test_contextual_risk_signals_sim_age_device_change_and_call_velocity(make_te
         files={"file": ("ctx9.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
     assert r9["outcome"] == "APPROVED"
+
+
+def test_metrics_decisions_per_min_p95_latency_and_ui_no_credit_wasted_copy(make_test_client):
+    latencies = [180.0, 220.0, 490.0]
+    call_idx = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            payload = copy.deepcopy(VERIFY_FIXTURE)
+            payload["timing"] = {"total_ms": latencies[min(call_idx["n"], len(latencies) - 1)]}
+            call_idx["n"] += 1
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-M95-1")
+
+    for i in range(3):
+        s = client.post(
+            "/api/v1/verification-sessions",
+            json={"sector": "helpdesk", "subject_ref": "SUB-M95-1", "action": "mfa_reset", "resource_ref": f"T-{i}"},
+        ).json()
+        r = client.post(
+            f"/api/v1/verification-sessions/{s['session_id']}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": (f"m{i}.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+        )
+        assert r.status_code == 200
+
+    metrics = client.get("/api/v1/metrics").json()
+    assert metrics["decisions_per_min"] >= 3.0
+    assert metrics["p50_latency_ms"] is not None
+    assert metrics["p95_latency_ms"] is not None
+    assert metrics["p95_latency_ms"] >= metrics["p50_latency_ms"]
+
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    assert "Decisions / min" in html
+    assert "p95 Latency" in html
+    assert "DetectifAI Credits" not in html
+    assert "credits wasted" not in html.lower()
+
+
+def test_fallback_completion_works_end_to_end_on_hold_and_writes_audit(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "hold.fallback.user",
+            "display_name": "Hold Fallback User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "HOLD-FB-1",
+            "consent_text": "Explicit speaker consent confirmed for fallback verification testing.",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    ).json()
+    sub = reg["user"]["subject_ref"]
+
+    # Silent audio triggers REVIEW / HOLD with 3 fallback options
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": sub, "action": "sim_replacement", "resource_ref": "SIM-HOLD-FB"},
+    ).json()
+    hold_res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("silent.wav", make_pcm_wav_bytes(6.0, silent=True), "audio/wav")},
+    ).json()
+    assert hold_res["outcome"] == "REVIEW / HOLD"
+    assert len(hold_res["fallback_options"]) == 3
+
+    # User clicks App Push fallback -> completes session end-to-end with simulated flag + single-use token
+    fb_done = client.post(
+        f"/api/v1/decisions/{sess['session_id']}/step-up/complete",
+        json={"method": "trusted_app_push"},
+    )
+    assert fb_done.status_code == 200
+    body = fb_done.json()
+    assert body["outcome"] == "APPROVED"
+    assert body["simulated"] is True
+    assert "STEP_UP_COMPLETED" in body["reason_codes"]
+    assert body["decision_token"] is not None
+
+    # Double fallback completion returns 409
+    assert client.post(
+        f"/api/v1/decisions/{sess['session_id']}/step-up/complete",
+        json={"method": "in_store_kyc"},
+    ).status_code == 409
+
+
+def test_expanded_redteam_sandbox_all_10_scenarios_expected_vs_actual(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    expected_outcomes = {
+        "token_replay": (409, "REJECTED"),
+        "action_substitution": (409, "REJECTED"),
+        "expired_challenge": (410, "REJECTED"),
+        "provider_outage_fail_closed": (503, "REVIEW / HOLD"),
+        "cross_domain_sim_alert": (200, "STEP-UP"),
+        "transcript_spoofing": (200, "REJECTED"),
+        "reencoded_replay": (200, "REJECTED"),
+        "policy_context_tampering": (200, "STEP-UP"),
+        "rate_limit_lockout": (429, "REJECTED"),
+        "audit_chain_tamper": (200, "REJECTED"),
+    }
+    for scenario, (exp_http, exp_outcome) in expected_outcomes.items():
+        resp = client.post(f"/api/v1/sandbox/run/{scenario}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["sandbox_test"] is True
+        assert data["passed"] is True
+        assert data["http_status"] == exp_http
+        assert data["outcome"] == exp_outcome
+        assert isinstance(data["expected"], dict) and isinstance(data["actual"], dict)
+
+    # Confirm live audit hash chain remained intact even after running audit_chain_tamper sandbox probe
+    assert client.get("/api/v1/audit/verify-chain").json()["valid"] is True
+
+
+def test_accuracy_report_endpoint_not_run_vs_loaded_json(make_test_client, tmp_path, monkeypatch):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    missing_path = tmp_path / "missing_eval.json"
+    monkeypatch.setenv("EVAL_REPORT_PATH", str(missing_path))
+    empty = client.get("/api/v1/accuracy/report")
+    assert empty.status_code == 200
+    assert empty.json()["status"] == "not_run"
+    assert empty.json()["message"] == "No evaluation run yet"
+    assert empty.json()["report"] is None
+
+    sample_report = {
+        "total_samples": 4,
+        "genuine_total": 2,
+        "attack_total": 2,
+        "far": 0.0,
+        "frr": 0.0,
+        "confusion_matrix": {"genuine_accepted_tp": 2, "genuine_rejected_fn": 0, "attack_blocked_tn": 2, "attack_accepted_fp": 0},
+    }
+    missing_path.write_text(json.dumps(sample_report), encoding="utf-8")
+    loaded = client.get("/api/v1/accuracy/report")
+    assert loaded.status_code == 200
+    assert loaded.json()["status"] == "available"
+    assert loaded.json()["report"]["confusion_matrix"]["attack_blocked_tn"] == 2
+
+
+def test_eval_accuracy_script_computes_real_far_frr_and_confusion_matrix(tmp_path):
+    from scripts.eval_accuracy import _discover_dataset, evaluate_labeled_records
+
+    (tmp_path / "genuine" / "hi-IN").mkdir(parents=True)
+    (tmp_path / "cloned").mkdir(parents=True)
+    (tmp_path / "genuine" / "hi-IN" / "g1.wav").write_bytes(make_pcm_wav_bytes(5.0))
+    (tmp_path / "cloned" / "c1.wav").write_bytes(make_pcm_wav_bytes(5.0))
+
+    discovered = _discover_dataset(tmp_path)
+    assert [(lbl, acc, p.name) for lbl, acc, p in discovered] == [
+        ("cloned", "unspecified", "c1.wav"),
+        ("genuine", "hi-IN", "g1.wav"),
+    ]
+
+    metrics = evaluate_labeled_records([
+        {"label": "genuine", "accent": "hi-IN", "outcome": "APPROVED"},
+        {"label": "noisy", "accent": "kn-IN", "outcome": "APPROVED"},
+        {"label": "genuine", "accent": "en-IN", "outcome": "REVIEW / HOLD"},
+        {"label": "cloned", "accent": "unspecified", "outcome": "REJECTED"},
+        {"label": "impostor", "accent": "en-IN", "outcome": "APPROVED"},
+    ])
+    assert metrics["total_samples"] == 5
+    assert metrics["far"] == 0.5
+    assert metrics["frr"] == 0.3333
+    assert metrics["confusion_matrix"] == {
+        "genuine_accepted_tp": 2,
+        "genuine_rejected_fn": 1,
+        "attack_blocked_tn": 1,
+        "attack_accepted_fp": 1,
+    }
+
+
+def test_negative_live_asr_mismatch_ignores_matching_client_transcript(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, demo_mode=False)
+    _enroll_subject(client, "SUB-NEG-ASR")
+
+    client._asr_cfg["transcript"] = "completely different wrong words"
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-NEG-ASR", "action": "sim_replacement", "resource_ref": "SIM-N1"},
+    ).json()
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": sess["challenge_text"]},  # Attacker spoofs client transcript
+        files={"file": ("spoof.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert res["outcome"] == "REJECTED"
+    assert "CHALLENGE_MISMATCH" in res["reason_codes"]
+    assert res["decision_token"] is None
+
+
+def test_repo_cleanup_stray_file_removed_and_docs_present():
+    assert not Path("0.26.0").exists()
+    assert Path("CHANGELOG.md").exists()
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert "Honest Limitations" in readme
+    assert "WEBHOOK_SIGNING_SECRET" in readme
+    assert "ASR_PROVIDER" in readme

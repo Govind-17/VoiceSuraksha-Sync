@@ -570,9 +570,9 @@
                 </div>
                 <p class="small" style="margin:0 0 10px;color:#5D4037;">Having mic issues, background noise, or a sore throat? Choose an alternative verification path without losing your request:</p>
                 <div class="btn-row">
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'App Push Approval')">Trusted App Push</button>
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'Verified Manager Callback')">Manager Callback</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'trusted_app_push', 'Trusted App Push Approval')">Trusted App Push</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'in_store_kyc', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('u-fallback-status', 'manager_callback', 'Verified Manager Callback')">Manager Callback</button>
                 </div>
                 <div class="status-line warn hidden" id="u-fallback-status"></div>
               </div>
@@ -626,8 +626,14 @@
           </div>
           <div class="soc-metric-tile">
             <div>
-              <div class="soc-metric-lbl">DetectifAI Credits</div>
-              <div class="soc-metric-val" id="metric-credits-balance">--</div>
+              <div class="soc-metric-lbl">Decisions / min</div>
+              <div class="soc-metric-val" id="metric-decisions-per-min">0.0</div>
+            </div>
+          </div>
+          <div class="soc-metric-tile">
+            <div>
+              <div class="soc-metric-lbl">p95 Latency</div>
+              <div class="soc-metric-val" id="metric-p95-latency">-- ms</div>
             </div>
           </div>
         </div>
@@ -856,14 +862,14 @@
               <div class="inconclusive-banner" id="inconclusive-banner">INCONCLUSIVE_EVIDENCE — Audio quality / evidence check failed.</div>
               <div class="card hidden" id="accessibility-fallback-card" style="margin-top:12px;border:1px solid #FBC02D;background:#FFFDF2;padding:14px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
-                  <strong style="font-size:13.5px;color:#8A5A00;">Non-Voice Accessibility Fallback</strong>
-                  <span class="pill warn">NO GENUINE USER TRAPPED</span>
+                  <strong style="font-size:13.5px;color:#8A5A00;">Non-Voice Accessibility Fallback (Simulated)</strong>
+                  <span class="pill warn">FAST RE-RECORD OR FALLBACK</span>
                 </div>
-                <p class="small" style="margin:0 0 10px;color:#5D4037;">Voice quality was too quiet, clipped, or inconclusive (no DetectifAI credits wasted). Route the user cleanly to a verified non-voice path:</p>
+                <p class="small" style="margin:0 0 10px;color:#5D4037;">Voice quality was quiet, clipped, or held for step-up security. Prompt for a quick re-record or click a simulated out-of-band path below (audit-logged):</p>
                 <div class="btn-row">
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'App Push Approval')">App Push</button>
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
-                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'Verified Manager Callback')">Manager Callback</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'trusted_app_push', 'App Push Approval')">App Push</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'in_store_kyc', 'In-Store Biometric KYC')">In-Store Biometric KYC</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="selectAccessibilityFallback('admin-fallback-status', 'manager_callback', 'Verified Manager Callback')">Manager Callback</button>
                 </div>
                 <div class="status-line warn hidden" id="admin-fallback-status"></div>
               </div>
@@ -952,14 +958,23 @@
           <div class="status-line" id="review-queue-status" style="background:rgba(255,255,255,0.04);color:#CBD5E1;">Reviewer actions write an immutable AuditEvent with timestamp.</div>
         </div>
 
+        <!-- Accuracy Evaluation Card -->
+        <div class="card" id="accuracy-card" style="margin-bottom:20px;">
+          <div class="card-hdr">
+            <div class="card-title"><span class="step-tag">EVAL</span> Accuracy &amp; Confusion Matrix (<code>scripts/eval_accuracy.py</code>)</div>
+            <span class="pill" id="accuracy-status-pill">CHECKING...</span>
+          </div>
+          <div id="accuracy-body" class="small">No evaluation run yet.</div>
+        </div>
+
         <!-- Red-Team Attack Sandbox -->
         <div class="obsidian-card" id="sandbox">
           <div class="card-hdr">
-            <div class="card-title"><span class="step-tag">SANDBOX STRESS TEST</span> Red-Team Attack Sandbox</div>
+            <div class="card-title"><span class="step-tag">SANDBOX STRESS TEST</span> Red-Team Attack Sandbox (10 Probes)</div>
             <span class="pill" style="background:rgba(251,192,45,0.14);border-color:rgba(251,192,45,0.45);color:#FBC02D;">SERVER-SIDE DETERMINISTIC PROBES</span>
           </div>
           <p class="small" style="color:#94A3B8;margin:0 0 14px;">
-            Fire real server-side security stress scenarios tagged <code style="color:#28CB8B;">sandbox_test=true</code> to demonstrate replay prevention, action binding, challenge expiry, fail-closed outages, and cross-domain SIM-to-Bank escalation.
+            Fire real server-side security stress scenarios tagged <code style="color:#28CB8B;">sandbox_test=true</code> and compare <strong style="color:#E2E8F0;">Expected vs Actual</strong> outcomes.
           </p>
           <div class="sandbox-grid">
             <button class="sandbox-btn" onclick="runSandboxScenario('token_replay')">
@@ -981,6 +996,26 @@
             <button class="sandbox-btn" onclick="runSandboxScenario('cross_domain_sim_alert')">
               <strong>Cross-Domain SIM→Bank</strong>
               <span>Expected: STEP-UP</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('transcript_spoofing')">
+              <strong>Transcript Spoofing</strong>
+              <span>Expected: CHALLENGE_MISMATCH</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('reencoded_replay')">
+              <strong>Re-Encoded Replay</strong>
+              <span>Expected: AUDIO_REPLAY_DETECTED</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('policy_context_tampering')">
+              <strong>Policy Context Tamper</strong>
+              <span>Expected: AFTER_HOURS STEP-UP</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('rate_limit_lockout')">
+              <strong>Rate-Limit Lockout</strong>
+              <span>Expected: HTTP 429</span>
+            </button>
+            <button class="sandbox-btn" onclick="runSandboxScenario('audit_chain_tamper')">
+              <strong>Audit Chain Tamper</strong>
+              <span>Expected: Detect break #0</span>
             </button>
           </div>
           <div class="sandbox-results" id="sandbox-results">
@@ -1495,7 +1530,12 @@
         oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : isBlock ? "REJECTED — REQUEST CANCELLED" : res.outcome;
         oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : isBlock ? "bad" : "warn");
         document.getElementById("u-next-step").textContent = res.next_step_script || "";
-        const showFallback = res.evidence_state === "INCONCLUSIVE_EVIDENCE" || (res.reason_codes || []).includes("AUDIO_QUALITY_LOW");
+        const showFallback = (
+          res.outcome === "REVIEW / HOLD"
+          || res.outcome === "STEP-UP"
+          || res.evidence_state === "INCONCLUSIVE_EVIDENCE"
+          || (res.fallback_options || []).length > 0
+        );
         document.getElementById("u-accessibility-fallback").classList.toggle("hidden", !showFallback);
         const fbStatus = document.getElementById("u-fallback-status");
         if (fbStatus && !showFallback) fbStatus.classList.add("hidden");
@@ -1532,14 +1572,15 @@
 
     async function refreshAdminPanels() {
       try {
-        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes, chainRes] = await Promise.all([
+        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes, chainRes, accRes] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/enrollments"),
           apiJson("/api/v1/audit"),
           apiJson("/api/v1/risk-events"),
           apiJson("/api/v1/metrics"),
           apiJson("/api/v1/admin/review-queue"),
-          apiJson("/api/v1/audit/verify-chain")
+          apiJson("/api/v1/audit/verify-chain"),
+          apiJson("/api/v1/accuracy/report")
         ]);
         const chainPill = document.getElementById("audit-chain-pill");
         if (chainPill) {
@@ -1548,14 +1589,16 @@
             ? `CHAIN VERIFIED (${chainRes.total_events} events)`
             : `CHAIN BROKEN (#${chainRes.first_broken_index})`;
         }
+        renderAccuracyReport(accRes);
         const enrolledCount = String(health.enrolled_count ?? (enrollRes.enrollments || []).length);
         document.getElementById("enrolled-count").textContent = enrolledCount;
         document.getElementById("stat-enrolled").textContent = enrolledCount;
 
         document.getElementById("metric-total-checks").textContent = String(metrics.total_verifications ?? 0);
         document.getElementById("metric-p50-latency").textContent = metrics.p50_latency_ms != null ? `${Number(metrics.p50_latency_ms).toFixed(1)} ms` : "-- ms";
+        document.getElementById("metric-p95-latency").textContent = metrics.p95_latency_ms != null ? `${Number(metrics.p95_latency_ms).toFixed(1)} ms` : "-- ms";
         document.getElementById("metric-blocked-threats").textContent = String(metrics.blocked_count ?? 0);
-        document.getElementById("metric-credits-balance").textContent = metrics.last_credits_balance != null ? Number(metrics.last_credits_balance).toLocaleString("en-US") : "--";
+        document.getElementById("metric-decisions-per-min").textContent = Number(metrics.decisions_per_min ?? 0).toFixed(1);
         document.getElementById("metric-active-alerts").textContent = String(metrics.active_risk_events_count ?? 0);
 
         state.enrollments = enrollRes.enrollments || [];
@@ -1815,7 +1858,12 @@
       ["cell-match-real", "cell-nomatch-real", "cell-match-fake", "cell-nomatch-fake"].forEach(id => { document.getElementById(id).className = "m-cell"; });
       const incBanner = document.getElementById("inconclusive-banner"); incBanner.classList.remove("visible");
       const fallbackCard = document.getElementById("accessibility-fallback-card");
-      const showFallback = res.evidence_state === "INCONCLUSIVE_EVIDENCE" || (res.reason_codes || []).includes("AUDIO_QUALITY_LOW");
+      const showFallback = (
+        res.outcome === "REVIEW / HOLD"
+        || res.outcome === "STEP-UP"
+        || res.evidence_state === "INCONCLUSIVE_EVIDENCE"
+        || (res.fallback_options || []).length > 0
+      );
       if (fallbackCard) fallbackCard.classList.toggle("hidden", !showFallback);
       const adminFbStatus = document.getElementById("admin-fallback-status");
       if (adminFbStatus && !showFallback) adminFbStatus.classList.add("hidden");
@@ -1990,11 +2038,68 @@
       }
     }
 
-    function selectAccessibilityFallback(targetStatusId, method) {
+    function renderAccuracyReport(accRes) {
+      const pill = document.getElementById("accuracy-status-pill");
+      const body = document.getElementById("accuracy-body");
+      if (!pill || !body) return;
+      if (!accRes || accRes.status !== "available" || !accRes.report) {
+        pill.className = "pill warn";
+        pill.textContent = "NOT RUN";
+        body.textContent = accRes?.message || "No evaluation run yet";
+        return;
+      }
+      const r = accRes.report;
+      const cm = r.confusion_matrix || {};
+      pill.className = "pill ok";
+      pill.textContent = `${r.total_samples ?? 0} SAMPLES`;
+      body.innerHTML = `<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px;">
+        <span><strong>FAR:</strong> ${r.far != null ? (Number(r.far) * 100).toFixed(2) + "%" : "N/A"}</span>
+        <span><strong>FRR:</strong> ${r.frr != null ? (Number(r.frr) * 100).toFixed(2) + "%" : "N/A"}</span>
+        <span><strong>Genuine:</strong> ${r.genuine_total ?? 0}</span>
+        <span><strong>Attacks:</strong> ${r.attack_total ?? 0}</span>
+      </div>
+      <table><thead><tr><th>Actual \\ Predicted</th><th>APPROVED</th><th>BLOCKED / HELD</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Genuine / Noisy</strong></td><td>${cm.genuine_accepted_tp ?? 0}</td><td>${cm.genuine_rejected_fn ?? 0}</td></tr>
+        <tr><td><strong>Cloned / Impostor</strong></td><td>${cm.attack_accepted_fp ?? 0}</td><td>${cm.attack_blocked_tn ?? 0}</td></tr>
+      </tbody></table>`;
+    }
+
+    async function selectAccessibilityFallback(targetStatusId, method, label) {
       const el = document.getElementById(targetStatusId);
       if (!el) return;
       el.classList.remove("hidden");
-      setStatus(targetStatusId, `Accessibility Fallback Initiated: ${method} — request routed without locking out genuine user.`, "warn");
+      const activeSess = targetStatusId.startsWith("u-") ? state.userSession : state.currentSession;
+      if (!activeSess?.session_id) {
+        setStatus(targetStatusId, `No active session found for ${label}.`, "err");
+        return;
+      }
+      setStatus(targetStatusId, `Submitting simulated ${label}...`, "warn");
+      try {
+        const res = await apiJson(`/api/v1/decisions/${encodeURIComponent(activeSess.session_id)}/step-up/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ method })
+        });
+        const ok = res.outcome === "APPROVED";
+        if (!targetStatusId.startsWith("u-")) {
+          state.lastVerification = { ...(state.lastVerification || {}), ...res };
+          state.tokenConsumed = false;
+          updateActionLockUi();
+          await refreshAdminPanels();
+        } else {
+          const uPill = document.getElementById("u-outcome-pill");
+          if (uPill) {
+            uPill.textContent = ok ? "APPROVED (SIMULATED FALLBACK)" : res.outcome;
+            uPill.className = "pill " + (ok ? "ok" : "warn");
+          }
+          document.getElementById("u-next-step").textContent = res.next_step_script || "";
+          await refreshUserDashboard();
+        }
+        setStatus(targetStatusId, `Simulated ${label} -> ${res.outcome} (${(res.reason_codes || []).join(", ")})`, ok ? "ok" : "warn");
+      } catch (err) {
+        setStatus(targetStatusId, `Fallback error: ${err.message}`, "err");
+      }
     }
 
     async function exportAuditDossier(sessionId) {
@@ -2020,13 +2125,13 @@
       try {
         const res = await apiJson(`/api/v1/sandbox/run/${encodeURIComponent(scenario)}`, { method: "POST" });
         const isStepUp = res.outcome === "STEP-UP";
-        const badgeClass = isStepUp ? "warn" : "bad";
-        const statusBadge = `<span class="pill ${badgeClass}">HTTP ${res.http_status} · ${escapeHtml(res.outcome)}</span>`;
+        const badgeClass = res.passed ? (isStepUp ? "warn" : "ok") : "bad";
+        const statusBadge = `<span class="pill ${badgeClass}">${res.passed ? "MATCH" : "DRIFT"} · HTTP ${res.http_status} · ${escapeHtml(res.outcome)}</span>`;
         const rowHtml = `<div class="sandbox-row">
           <div>
             <span class="pill ok" style="margin-right:6px;">SANDBOX STRESS TEST</span>
             <strong>${escapeHtml(res.scenario)}</strong> — <span style="color:#CBD5E1;">${escapeHtml(res.detail)}</span>
-            <div style="color:#94A3B8;margin-top:4px;">Reasons: ${escapeHtml((res.reason_codes || []).join(", "))} · Session: ${escapeHtml(String(res.session_id || "").slice(0, 12))}</div>
+            <div style="color:#94A3B8;margin-top:4px;">Expected: <code>${escapeHtml(JSON.stringify(res.expected || {}))}</code> | Actual: <code>${escapeHtml(JSON.stringify(res.actual || {}))}</code></div>
           </div>
           <div class="btn-row">
             ${statusBadge}

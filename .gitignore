@@ -3,6 +3,9 @@
 __pycache__/
 .pytest_cache/
 test_audio/
+reports/
 *.db
+*.db-shm
+*.db-wal
 *.wav
 *.m4a
