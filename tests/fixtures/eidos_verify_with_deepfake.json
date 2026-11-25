@@ -1,0 +1,119 @@
+{
+  "request_id": "req_<REDACTED>",
+  "operation_id": "op_<REDACTED>",
+  "object": "speaker.verification",
+  "speaker_id": "SUB-DEMO-01",
+  "result": {
+    "decision": "match",
+    "similarity": 0.785346,
+    "threshold": 0.53,
+    "similarity_semantics": "Higher means the two voices are more alike. Not a percentage.",
+    "duration_seconds": 27.904
+  },
+  "deepfake": {
+    "label": "genuine",
+    "is_synthetic": false,
+    "score": 0.056948,
+    "threshold": 0.62,
+    "score_semantics": "Higher means more likely AI-generated. Decide with the verdict, not the score alone.",
+    "duration_seconds": 27.904,
+    "scored_seconds": 27.904,
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 4.0,
+        "score": 0.067686,
+        "verdict": "real"
+      },
+      {
+        "start": 2.0,
+        "end": 6.0,
+        "score": 0.028551,
+        "verdict": "real"
+      },
+      {
+        "start": 4.0,
+        "end": 8.0,
+        "score": 0.085557,
+        "verdict": "real"
+      },
+      {
+        "start": 6.0,
+        "end": 10.0,
+        "score": 0.038359,
+        "verdict": "real"
+      },
+      {
+        "start": 8.0,
+        "end": 12.0,
+        "score": 0.019561,
+        "verdict": "real"
+      },
+      {
+        "start": 10.0,
+        "end": 14.0,
+        "score": 0.055822,
+        "verdict": "real"
+      },
+      {
+        "start": 12.0,
+        "end": 16.0,
+        "score": 0.2747,
+        "verdict": "real"
+      },
+      {
+        "start": 14.0,
+        "end": 18.0,
+        "score": 0.092599,
+        "verdict": "real"
+      },
+      {
+        "start": 16.0,
+        "end": 20.0,
+        "score": 0.012547,
+        "verdict": "real"
+      },
+      {
+        "start": 18.0,
+        "end": 22.0,
+        "score": 0.014673,
+        "verdict": "real"
+      },
+      {
+        "start": 20.0,
+        "end": 24.0,
+        "score": 0.040562,
+        "verdict": "real"
+      },
+      {
+        "start": 22.0,
+        "end": 26.0,
+        "score": 0.006153,
+        "verdict": "real"
+      },
+      {
+        "start": 23.904,
+        "end": 27.904,
+        "score": 0.003551,
+        "verdict": "real"
+      }
+    ],
+    "verdict": "real",
+    "operation_id": "op_<REDACTED>",
+    "credits_charged": 56,
+    "model": {
+      "name": "aletheia",
+      "version": "2026.10"
+    }
+  },
+  "model": {
+    "name": "eidos",
+    "version": "b2adcc85166a"
+  },
+  "credits": {
+    "charged": 556,
+    "balance": 4244
+  },
+  "latency_ms": 971.3,
+  "idempotent_replay": false
+}
