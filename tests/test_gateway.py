@@ -167,7 +167,8 @@ def test_happy_path_telecom_sim_replacement_and_consume(make_test_client, db_ses
     )
     assert audio_resp.status_code == 200
     result = audio_resp.json()
-    assert result["outcome"] == "PASS"
+    assert result["outcome"] == "APPROVED"
+    assert result["status"] == "APPROVED"
     assert result["evidence_state"] == "ACOUSTIC_PASS"
     assert result["phrase_match"] is True
     assert result["voice_result"]["speaker_decision"] == "match"
@@ -216,7 +217,8 @@ def test_wrong_phrase_and_session_replay(make_test_client):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["outcome"] == "REJECT_REQUEST"
+    assert data["outcome"] == "REJECTED"
+    assert data["status"] == "CANCELLED"
     assert data["reason_codes"] == ["CHALLENGE_MISMATCH"]
     assert data["decision_token"] is None
     assert data["emitted_risk_event"]["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED"
@@ -259,7 +261,7 @@ def test_expired_session_rejected(make_test_client, db_session_factory):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["outcome"] == "REJECT_REQUEST"
+    assert data["outcome"] == "REJECTED"
     assert data["reason_codes"] == ["CHALLENGE_EXPIRED"]
     assert data["decision_token"] is None
     assert len(captured_headers) == 1
@@ -293,7 +295,8 @@ def test_synthetic_deepfake_verdict_rejected(make_test_client):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["outcome"] == "REJECT_REQUEST"
+    assert data["outcome"] == "REJECTED"
+    assert data["status"] == "CANCELLED"
     assert data["evidence_state"] == "SYNTHETIC_INDICATOR"
     assert "DEEPFAKE_SIGNAL" in data["reason_codes"]
     assert data["decision_token"] is None
@@ -414,7 +417,8 @@ def test_cross_domain_sim_swap_alert_holds_banking(make_test_client):
         data={"spoken_transcript": bank_sess["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert bank_res["outcome"] == "REVIEW / HOLD"
+    assert bank_res["outcome"] == "REJECTED"
+    assert bank_res["status"] == "CANCELLED"
     assert "CROSS_DOMAIN_ALERT" in bank_res["reason_codes"]
     assert bank_res["decision_token"] is None
 
@@ -437,7 +441,7 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
     client = make_test_client(handler)
     _enroll_subject(client, "SUB-401")
 
-    # Timeout case -> fail closed REVIEW / HOLD
+    # Timeout case -> fail closed REJECTED (CANCELLED)
     sess1 = client.post(
         "/api/v1/verification-sessions",
         json={
@@ -452,12 +456,13 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
         data={"spoken_transcript": sess1["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert res1["outcome"] == "REVIEW / HOLD"
+    assert res1["outcome"] == "REJECTED"
+    assert res1["status"] == "CANCELLED"
     assert res1["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert res1["reason_codes"] == ["PROVIDER_UNAVAILABLE"]
     assert res1["decision_token"] is None
 
-    # 403 insufficient_scope case -> fail closed REVIEW / HOLD
+    # 403 insufficient_scope case -> fail closed REJECTED (CANCELLED)
     mode["behavior"] = "403"
     sess2 = client.post(
         "/api/v1/verification-sessions",
@@ -473,7 +478,8 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
         data={"spoken_transcript": sess2["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert res2["outcome"] == "REVIEW / HOLD"
+    assert res2["outcome"] == "REJECTED"
+    assert res2["status"] == "CANCELLED"
     assert res2["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert res2["reason_codes"] == ["PROVIDER_UNAVAILABLE"]
     assert res2["decision_token"] is None
@@ -520,10 +526,10 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
         data={"spoken_transcript": emerg_sess["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert emerg_res["outcome"] == "PASS"
+    assert emerg_res["outcome"] == "APPROVED"
     assert emerg_res["decision_token"] is not None
 
-    # Short <4s clip -> INCONCLUSIVE_EVIDENCE (AUDIO_QUALITY_LOW)
+    # Short <4s clip -> INCONCLUSIVE_EVIDENCE (REJECTED & CANCELLED)
     short_sess = client.post(
         "/api/v1/verification-sessions",
         json={
@@ -538,7 +544,8 @@ def test_contextual_step_ups_and_protective_low_friction(make_test_client):
         data={"spoken_transcript": short_sess["challenge_text"]},
         files={"file": ("short.wav", make_pcm_wav_bytes(2.5), "audio/wav")},
     ).json()
-    assert short_res["outcome"] == "REVIEW / HOLD"
+    assert short_res["outcome"] == "REJECTED"
+    assert short_res["status"] == "CANCELLED"
     assert short_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert short_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
 
@@ -590,7 +597,7 @@ def test_clear_demo_alerts_keeps_enrollments_intact(make_test_client):
         data={"spoken_transcript": bank_sess["challenge_text"]},
         files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
     ).json()
-    assert bank_res["outcome"] == "PASS"
+    assert bank_res["outcome"] == "APPROVED"
     assert bank_res["decision_token"] is not None
 
 
@@ -610,7 +617,7 @@ def test_voice_first_mode_passes_without_exact_transcript(make_test_client):
     ).json()
     assert sess["challenge_text"].startswith("Confirm sim replacement code ")
 
-    # Even with different/empty spoken_transcript, voice-first mode runs Eidos + Aletheia and passes on voice match
+    # Even with different/empty spoken_transcript, voice-first mode runs Eidos + Aletheia and approves on voice match
     res = client.post(
         f"/api/v1/verification-sessions/{sess['session_id']}/audio",
         data={"spoken_transcript": "hi my name is govind testing our hackathon project"},
@@ -619,7 +626,8 @@ def test_voice_first_mode_passes_without_exact_transcript(make_test_client):
     assert res.status_code == 200
     data = res.json()
     assert data["phrase_match"] is False
-    assert data["outcome"] == "PASS"
+    assert data["outcome"] == "APPROVED"
+    assert data["status"] == "APPROVED"
     assert data["voice_result"]["speaker_decision"] == "match"
     assert data["voice_result"]["deepfake_verdict"] == "real"
     assert data["decision_token"] is not None
@@ -703,7 +711,8 @@ def test_user_register_login_and_strict_isolation(make_test_client):
     )
     assert ver.status_code == 200
     ver_json = ver.json()
-    assert ver_json["outcome"] == "PASS"
+    assert ver_json["outcome"] == "APPROVED"
+    assert ver_json["status"] == "APPROVED"
     assert "decision_token" not in ver_json
     assert ver_json["voice_summary"]["speaker_decision"] == "match"
 
@@ -739,3 +748,95 @@ def test_user_register_login_and_strict_isolation(make_test_client):
     assert adm.json()["user"]["role"] == "admin"
     assert len(client.get("/api/v1/enrollments").json()["enrollments"]) == 1
     assert len(client.get("/api/v1/audit").json()["audit_events"]) == 1
+
+
+def test_speaker_no_match_directly_rejected_and_cancelled(make_test_client):
+    no_match_verify = copy.deepcopy(VERIFY_FIXTURE)
+    no_match_verify["result"]["decision"] = "no_match"
+    no_match_verify["result"]["similarity"] = 0.08
+
+    handler, _ = _default_fixture_handler(verify_override=no_match_verify)
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-801")
+
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": "SUB-801",
+            "action": "sim_replacement",
+            "resource_ref": "SIM-MASKED-801",
+        },
+    ).json()
+
+    res = client.post(
+        f"/api/v1/verification-sessions/{sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert res["outcome"] == "REJECTED"
+    assert res["status"] == "CANCELLED"
+    assert res["reason_codes"] == ["SPEAKER_NO_MATCH"]
+    assert res["decision_token"] is None
+
+
+def test_register_with_voice_saves_voiceprint_and_login_skips_reenroll(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+
+    # Short audio at registration is rejected cleanly and does NOT create a half-registered account
+    bad = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "bad.wav.user",
+            "display_name": "Bad Wav",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "REG-CONSENT-0",
+        },
+        files={"file": ("short.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    )
+    assert bad.status_code == 400
+    assert (
+        client.post("/api/v1/auth/login", json={"username": "bad.wav.user", "password": "password123"}).status_code
+        == 401
+    )
+
+    # Valid registration enrolls voiceprint atomically and attaches it to the user account
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "priya.nair",
+            "display_name": "Priya Nair",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "REG-CONSENT-1",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reg.status_code == 200
+    reg_body = reg.json()
+    assert reg_body["authenticated"] is True
+    subject_ref = reg_body["user"]["subject_ref"]
+    assert reg_body["enrollment"]["subject_ref"] == subject_ref
+
+    ov1 = client.get("/api/v1/user/overview")
+    assert ov1.status_code == 200
+    assert ov1.json()["enrollment"]["subject_ref"] == subject_ref
+
+    # Logout and sign back in: saved voiceprint stays on the account and user cannot re-enroll
+    client.post("/api/v1/auth/logout")
+    login = client.post("/api/v1/auth/login", json={"username": "priya.nair", "password": "password123"})
+    assert login.status_code == 200
+    assert login.json()["user"]["subject_ref"] == subject_ref
+
+    ov2 = client.get("/api/v1/user/overview")
+    assert ov2.status_code == 200
+    assert ov2.json()["enrollment"]["subject_ref"] == subject_ref
+
+    reenroll = client.post(
+        "/api/v1/enrollments",
+        data={"subject_ref": subject_ref, "consent_confirmed": "true", "consent_ref": "RETRY"},
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reenroll.status_code == 409

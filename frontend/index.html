@@ -369,6 +369,26 @@
               <label for="user-auth-password">Password (min 6 chars)</label>
               <input type="password" id="user-auth-password" placeholder="••••••••" autocomplete="current-password" />
             </div>
+            <div class="hidden" id="user-reg-voice-wrap" style="border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:14px;background:var(--neutral-bg);">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
+                <strong style="font-size:13px;">One-Time Voiceprint Enrollment</strong>
+                <span class="pill" id="reg-enroll-timer">0.0s / 15–60s</span>
+              </div>
+              <div class="form-row" style="margin-bottom:8px;">
+                <label for="reg-enroll-consent-ref">Consent Reference</label>
+                <input type="text" id="reg-enroll-consent-ref" value="USER-REG-CONSENT-2026" />
+              </div>
+              <label class="check-row" style="margin-bottom:10px;">
+                <input type="checkbox" id="reg-enroll-consent" />
+                <span>I consent to saving my voiceprint to this account (SHA-256 hash &amp; Eidos speaker ref only — raw audio is never stored).</span>
+              </label>
+              <div class="btn-row" style="margin-bottom:8px;">
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-rec-reg-enroll" onclick="toggleMic('reg-enroll')">Record Voiceprint (15–60s)</button>
+                <input type="file" id="file-reg-enroll" accept=".wav,audio/wav" onchange="onFilePicked('reg-enroll')" />
+              </div>
+              <div class="small" id="reg-enroll-file-info" style="margin-bottom:6px;">No WAV captured yet</div>
+              <div class="status-line" id="reg-enroll-status">Required once at registration; future logins skip enrollment.</div>
+            </div>
             <button class="btn btn-primary" style="width:100%;" id="btn-user-auth-submit" onclick="submitUserAuth()">Sign In to User Dashboard</button>
           </div>
 
@@ -404,9 +424,17 @@
       </div>
 
       <div class="ws-grid">
-        <!-- User Left Column: Enroll + Request -->
+        <!-- User Left Column: Saved Voiceprint Status (or fallback Enroll) + Request -->
         <div class="col">
-          <div class="card">
+          <div class="card hidden" id="user-voice-saved-card">
+            <div class="card-hdr">
+              <div class="card-title"><span class="step-tag">MY VOICE</span> Account Voiceprint Saved</div>
+              <span class="pill ok" id="user-saved-secs">ACTIVE</span>
+            </div>
+            <div class="status-line ok" id="user-voice-saved-summary">Voiceprint already saved on your account. No re-enrollment required on login.</div>
+          </div>
+
+          <div class="card hidden" id="user-enroll-card">
             <div class="card-hdr">
               <div class="card-title"><span class="step-tag">MY VOICE</span> Consent-Gated Voiceprint Enrollment</div>
               <span class="pill" id="user-enroll-timer">0.0s / 15–60s</span>
@@ -717,12 +745,12 @@
                 <span class="pill" id="outcome-pill">OUTCOME: PENDING</span>
               </div>
               <div class="matrix-grid">
-                <div class="m-cell" id="cell-match-real"><div class="m-title">MATCH + REAL</div><div class="m-sub">ACOUSTIC_PASS (policy rules apply)</div></div>
-                <div class="m-cell" id="cell-nomatch-real"><div class="m-title">NO_MATCH + REAL</div><div class="m-sub">SPEAKER_NO_MATCH → REVIEW / HOLD</div></div>
-                <div class="m-cell" id="cell-match-fake"><div class="m-title">MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECT_REQUEST</div></div>
-                <div class="m-cell" id="cell-nomatch-fake"><div class="m-title">NO_MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECT_REQUEST</div></div>
+                <div class="m-cell" id="cell-match-real"><div class="m-title">MATCH + REAL</div><div class="m-sub">ACOUSTIC_PASS → APPROVED (next step)</div></div>
+                <div class="m-cell" id="cell-nomatch-real"><div class="m-title">NO_MATCH + REAL</div><div class="m-sub">SPEAKER_NO_MATCH → REJECTED (cancelled)</div></div>
+                <div class="m-cell" id="cell-match-fake"><div class="m-title">MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECTED (cancelled)</div></div>
+                <div class="m-cell" id="cell-nomatch-fake"><div class="m-title">NO_MATCH + FAKE</div><div class="m-sub">SYNTHETIC_INDICATOR → REJECTED (cancelled)</div></div>
               </div>
-              <div class="inconclusive-banner" id="inconclusive-banner">INCONCLUSIVE_EVIDENCE — Fail-closed REVIEW / HOLD.</div>
+              <div class="inconclusive-banner" id="inconclusive-banner">INCONCLUSIVE_EVIDENCE — Request REJECTED &amp; CANCELLED.</div>
 
               <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--silver);">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -731,10 +759,10 @@
                 </div>
                 <div class="reason-chips" id="reason-chips"><span class="chip">AWAITING_EVIDENCE</span></div>
                 <div class="mono-box" id="agent-script-box" style="font-size:12px;">
-                  Rule 03 (Evidence, Not Proof): Calm, non-accusatory next-step guidance appears here once acoustic evidence is evaluated.
+                  Decision guidance will appear here once acoustic evidence is evaluated.
                 </div>
                 <button class="lock-btn locked" id="action-lock-btn" onclick="consumeDecision()" disabled>LOCKED — APPROVE SIM REPLACEMENT</button>
-                <div class="status-line" id="consume-status">Action remains locked until PASS issues a short-lived one-time decision token.</div>
+                <div class="status-line" id="consume-status">Action remains locked until voice match returns APPROVED.</div>
               </div>
             </div>
           </div>
@@ -754,6 +782,19 @@
             <div class="stat-item"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#4CAF4F" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg><div><div class="stat-num" id="stat-audits">0</div><div class="stat-lbl">Audit Events</div></div></div>
             <div class="stat-item"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#4CAF4F" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg><div><div class="stat-num" id="stat-risks">0</div><div class="stat-lbl">Simulated Risk Alerts</div></div></div>
             <div class="stat-item"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#4CAF4F" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg><div><div class="stat-num">4</div><div class="stat-lbl">Gateway Profiles</div></div></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:20px;">
+          <div class="card-hdr">
+            <div class="card-title"><span class="step-tag">EIDOS</span> Enrolled Subjects Registry</div>
+            <button class="btn btn-ghost btn-sm" onclick="refreshAdminPanels()">Refresh Subjects</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Subject Ref</th><th>Consent Ref</th><th>Speech (s)</th><th>Audio SHA-256</th><th>Enrolled At (UTC)</th></tr></thead>
+              <tbody id="enrolled-tbody"><tr><td colspan="5" class="small">No enrolled subjects yet.</td></tr></tbody>
+            </table>
           </div>
         </div>
 
@@ -805,6 +846,7 @@
       userSession: null,
       userChallengeTimerId: null,
       blobs: {
+        "reg-enroll": null,
         "admin-enroll": null,
         "admin-verify": null,
         "user-enroll": null,
@@ -855,10 +897,14 @@
 
     function switchUserAuthMode(mode) {
       state.userAuthMode = mode;
+      if (mode !== "register" && state.rec.target === "reg-enroll") {
+        stopMic();
+      }
       document.getElementById("sub-user-login").classList.toggle("active", mode === "login");
       document.getElementById("sub-user-reg").classList.toggle("active", mode === "register");
       document.getElementById("user-reg-name-wrap").classList.toggle("hidden", mode !== "register");
-      document.getElementById("btn-user-auth-submit").textContent = mode === "register" ? "Create Account & Open User Dashboard" : "Sign In to User Dashboard";
+      document.getElementById("user-reg-voice-wrap").classList.toggle("hidden", mode !== "register");
+      document.getElementById("btn-user-auth-submit").textContent = mode === "register" ? "Create Account & Enroll Voiceprint" : "Sign In to User Dashboard";
     }
 
     async function submitUserAuth() {
@@ -866,15 +912,30 @@
       const password = document.getElementById("user-auth-password").value;
       const displayName = document.getElementById("user-auth-display").value.trim();
       if (!username || !password) { setStatus("auth-status", "Enter username and password.", "warn"); return; }
+      const submitBtn = document.getElementById("btn-user-auth-submit");
       try {
         let res;
         if (state.userAuthMode === "register") {
           if (!displayName) { setStatus("auth-status", "Enter your full name to register.", "warn"); return; }
-          res = await apiJson("/api/v1/auth/register", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, display_name: displayName, password })
-          });
+          if (password.length < 6) { setStatus("auth-status", "Password must be at least 6 characters.", "warn"); return; }
+          const consentOk = document.getElementById("reg-enroll-consent").checked;
+          const consentRef = document.getElementById("reg-enroll-consent-ref").value.trim() || "USER-REG-CONSENT-2026";
+          if (!consentOk) { setStatus("reg-enroll-status", "Confirm consent to save your voiceprint.", "err"); setStatus("auth-status", "Confirm voiceprint consent before creating account.", "err"); return; }
+          if (!state.blobs["reg-enroll"]) { setStatus("reg-enroll-status", "Record or upload a 15–60s WAV file to enroll.", "warn"); setStatus("auth-status", "Capture or upload a 15–60s WAV voiceprint to register.", "warn"); return; }
+
+          const fd = new FormData();
+          fd.append("username", username);
+          fd.append("display_name", displayName);
+          fd.append("password", password);
+          fd.append("consent_confirmed", "true");
+          fd.append("consent_ref", consentRef);
+          fd.append("file", state.blobs["reg-enroll"], state.blobs["reg-enroll"].name || "reg-enroll.wav");
+
+          submitBtn.disabled = true;
+          submitBtn.textContent = "Enrolling Voiceprint & Creating Account...";
+          setStatus("reg-enroll-status", "Enrolling voiceprint via Eidos and saving account...", "warn");
+          res = await apiJson("/api/v1/auth/register-with-voice", { method: "POST", body: fd });
+          state.blobs["reg-enroll"] = null;
         } else {
           res = await apiJson("/api/v1/auth/login", {
             method: "POST",
@@ -885,6 +946,12 @@
         await applyAuthState(res.user);
       } catch (err) {
         setStatus("auth-status", err.message, "err");
+        if (state.userAuthMode === "register") {
+          setStatus("reg-enroll-status", err.message, "err");
+        }
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = state.userAuthMode === "register" ? "Create Account & Enroll Voiceprint" : "Sign In to User Dashboard";
       }
     }
 
@@ -911,6 +978,17 @@
 
     async function logout() {
       try { await apiJson("/api/v1/auth/logout", { method: "POST" }); } catch (_) {}
+      state.blobs["reg-enroll"] = null;
+      const regFile = document.getElementById("file-reg-enroll");
+      if (regFile) regFile.value = "";
+      const regConsent = document.getElementById("reg-enroll-consent");
+      if (regConsent) regConsent.checked = false;
+      const regTimer = document.getElementById("reg-enroll-timer");
+      if (regTimer) { regTimer.textContent = "0.0s / 15–60s"; regTimer.className = "pill"; }
+      const regInfo = document.getElementById("reg-enroll-file-info");
+      if (regInfo) regInfo.textContent = "No WAV captured yet";
+      setStatus("reg-enroll-status", "Required once at registration; future logins skip enrollment.");
+      setStatus("auth-status", "Sign in or register to unlock your dashboard.");
       await applyAuthState(null);
     }
 
@@ -1030,6 +1108,7 @@
     }
 
     const REC_UI = {
+      "reg-enroll":   { btn: "btn-rec-reg-enroll", pill: "reg-enroll-timer", info: "reg-enroll-file-info", status: "reg-enroll-status", enroll: true, idleLabel: "Record Voiceprint (15–60s)" },
       "admin-enroll": { btn: "btn-rec-enroll", pill: "enroll-timer-pill", info: "enroll-file-info", status: "enroll-status", enroll: true, idleLabel: "Start Enrollment Mic (15–60s)" },
       "admin-verify": { btn: "btn-rec-verify", pill: "verify-timer-pill", info: "verify-file-info", status: "verify-status", enroll: false, canvas: "waveform-canvas", idleLabel: "Start Live Voice Mic (8–15s)" },
       "user-enroll":  { btn: "btn-rec-user-enroll", pill: "user-enroll-timer", info: "u-enroll-file-info", status: "u-enroll-status", enroll: true, idleLabel: "Record Enrollment (15–60s)" },
@@ -1093,7 +1172,13 @@
     }
 
     function onFilePicked(target) {
-      const inputId = { "admin-enroll": "file-enroll", "admin-verify": "file-verify", "user-enroll": "file-user-enroll", "user-verify": "file-user-verify" }[target];
+      const inputId = {
+        "reg-enroll": "file-reg-enroll",
+        "admin-enroll": "file-enroll",
+        "admin-verify": "file-verify",
+        "user-enroll": "file-user-enroll",
+        "user-verify": "file-user-verify"
+      }[target];
       const input = document.getElementById(inputId);
       const file = input.files && input.files[0];
       if (!file) return;
@@ -1121,10 +1206,23 @@
       try {
         const data = await apiJson("/api/v1/user/overview");
         const badge = document.getElementById("user-enroll-badge");
-        if (data.enrollment) {
+        const enrollCard = document.getElementById("user-enroll-card");
+        const savedCard = document.getElementById("user-voice-saved-card");
+        const isEnrolled = Boolean(data.enrollment);
+
+        enrollCard.classList.toggle("hidden", isEnrolled);
+        savedCard.classList.toggle("hidden", !isEnrolled);
+
+        if (isEnrolled) {
+          const secs = Number(data.enrollment.speech_seconds).toFixed(1);
           badge.className = "pill ok";
-          badge.textContent = `VOICE ENROLLED (${Number(data.enrollment.speech_seconds).toFixed(1)}s)`;
-          setStatus("u-enroll-status", `Enrolled ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...)`, "ok");
+          badge.textContent = `VOICEPRINT SAVED (${secs}s)`;
+          document.getElementById("user-saved-secs").textContent = `${secs}s ENROLLED`;
+          setStatus(
+            "user-voice-saved-summary",
+            `Saved on account for ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...). Re-enrollment is skipped on login — submit a verification request below.`,
+            "ok"
+          );
         } else {
           badge.className = "pill warn";
           badge.textContent = "NOT ENROLLED YET";
@@ -1135,7 +1233,7 @@
           tbody.innerHTML = `<tr><td colspan="4" class="small">No verification requests yet.</td></tr>`;
         } else {
           tbody.innerHTML = rows.map(r => {
-            const color = r.outcome === "PASS" ? "var(--success)" : r.outcome === "REJECT_REQUEST" ? "var(--error)" : "#9A6700";
+            const color = r.outcome === "APPROVED" ? "var(--success)" : r.outcome === "REJECTED" ? "var(--error)" : "#9A6700";
             return `<tr><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td>${escapeHtml(r.resource_ref)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td></tr>`;
           }).join("");
         }
@@ -1203,10 +1301,10 @@
       try {
         const res = await apiJson(`/api/v1/verification-sessions/${state.userSession.session_id}/audio`, { method: "POST", body: fd });
         const oPill = document.getElementById("u-outcome-pill");
-        oPill.textContent = res.outcome;
-        oPill.className = "pill " + (res.outcome === "PASS" ? "ok" : res.outcome === "REJECT_REQUEST" ? "bad" : "warn");
+        oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : res.outcome === "REJECTED" ? "REJECTED — REQUEST CANCELLED" : res.outcome;
+        oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : res.outcome === "REJECTED" ? "bad" : "warn");
         document.getElementById("u-next-step").textContent = res.next_step_script || "";
-        setStatus("u-verify-status", `Result: ${res.outcome}`, res.outcome === "PASS" ? "ok" : "warn");
+        setStatus("u-verify-status", `Result: ${oPill.textContent}`, res.outcome === "APPROVED" ? "ok" : "err");
         await refreshUserDashboard();
       } catch (err) {
         setStatus("u-verify-status", err.message, "err");
@@ -1242,6 +1340,7 @@
 
         state.enrollments = enrollRes.enrollments || [];
         renderSubjectDropdown();
+        renderEnrolledTable(state.enrollments);
         state.riskEvents = riskRes.risk_events || [];
         document.getElementById("stat-risks").textContent = String(state.riskEvents.length);
         refreshRiskBanner();
@@ -1418,7 +1517,7 @@
         const res = await apiJson(`/api/v1/verification-sessions/${state.currentSession.session_id}/audio`, { method: "POST", body: fd });
         state.lastVerification = res; state.tokenConsumed = false;
         renderTelemetry(res); updateActionLockUi();
-        setStatus("verify-status", `Evaluation complete: ${res.outcome} (${res.evidence_state})`, res.outcome === "PASS" ? "ok" : "warn");
+        setStatus("verify-status", `Evaluation complete: ${res.outcome} (${res.evidence_state})`, res.outcome === "APPROVED" ? "ok" : "err");
         await refreshAdminPanels();
       } catch (err) { setStatus("verify-status", err.message, "err"); }
     }
@@ -1464,9 +1563,9 @@
       if (res.evidence_state === "INCONCLUSIVE_EVIDENCE" || res.evidence_state === "CHALLENGE_FAILED") {
         incBanner.textContent = `${res.evidence_state} — ${(res.reason_codes || []).join(", ")}`; incBanner.classList.add("visible");
       } else if (eDecision === "match" && aVerdict === "real") {
-        document.getElementById("cell-match-real").classList.add("active", res.outcome === "PASS" ? "pass" : "hold");
+        document.getElementById("cell-match-real").classList.add("active", res.outcome === "APPROVED" ? "pass" : res.outcome === "REJECTED" ? "reject" : "hold");
       } else if (eDecision === "no_match" && aVerdict === "real") {
-        document.getElementById("cell-nomatch-real").classList.add("active", "hold");
+        document.getElementById("cell-nomatch-real").classList.add("active", "reject");
       } else if (eDecision === "match" && aVerdict === "fake") {
         document.getElementById("cell-match-fake").classList.add("active", "reject");
       } else if (eDecision === "no_match" && aVerdict === "fake") {
@@ -1474,8 +1573,8 @@
       }
 
       const oPill = document.getElementById("outcome-pill");
-      oPill.textContent = `OUTCOME: ${res.outcome}`;
-      oPill.className = "pill " + (res.outcome === "PASS" ? "ok" : res.outcome === "REJECT_REQUEST" ? "bad" : "warn");
+      oPill.textContent = res.outcome === "APPROVED" ? "OUTCOME: APPROVED" : res.outcome === "REJECTED" ? "OUTCOME: REJECTED (CANCELLED)" : `OUTCOME: ${res.outcome}`;
+      oPill.className = "pill " + (res.outcome === "APPROVED" ? "ok" : res.outcome === "REJECTED" ? "bad" : "warn");
 
       const chipsEl = document.getElementById("reason-chips"); chipsEl.innerHTML = "";
       const codes = res.reason_codes && res.reason_codes.length ? res.reason_codes : ["ALL_CHECKS_PASSED"];
@@ -1496,22 +1595,22 @@
       if (!v) {
         btn.className = "lock-btn locked"; btn.disabled = true; btn.textContent = `LOCKED — ${verb}`;
         tokenLabel.textContent = "No decision token issued";
-        setStatus("consume-status", "Action remains locked until PASS issues a short-lived one-time decision token.", ""); return;
+        setStatus("consume-status", "Action remains locked until voice match returns APPROVED.", ""); return;
       }
-      if (v.outcome !== "PASS" || !v.decision_token) {
-        btn.className = "lock-btn locked"; btn.disabled = true; btn.textContent = `LOCKED (${v.outcome}) — ${verb}`;
-        tokenLabel.textContent = "Token withheld by policy engine";
-        setStatus("consume-status", `Server refused token issuance (${v.outcome}). Follow the non-accusatory operator script above.`, "err"); return;
+      if (v.outcome !== "APPROVED" || !v.decision_token) {
+        btn.className = "lock-btn locked"; btn.disabled = true; btn.textContent = `REJECTED — REQUEST CANCELLED (${verb})`;
+        tokenLabel.textContent = "Request cancelled — no token issued";
+        setStatus("consume-status", `Request cancelled (${v.outcome}). Voice did not verify for next step.`, "err"); return;
       }
       if (state.tokenConsumed) {
         btn.className = "lock-btn consumed"; btn.disabled = false;
-        btn.textContent = "ACTION AUTHORIZED — TOKEN CONSUMED (CLICK TO TEST HTTP 409 REPLAY)";
+        btn.textContent = "APPROVED & EXECUTED — TOKEN CONSUMED (CLICK TO TEST HTTP 409 REPLAY)";
         tokenLabel.textContent = "Token consumed (single-use)"; return;
       }
       btn.className = "lock-btn unlocked"; btn.disabled = false;
-      btn.textContent = `${verb} (CONSUME ONE-TIME TOKEN)`;
+      btn.textContent = `APPROVED FOR NEXT STEP — ${verb} (CONSUME TOKEN)`;
       tokenLabel.textContent = `Token active until ${new Date(v.token_expires_at).toLocaleTimeString()}`;
-      setStatus("consume-status", "One-time decision token ready. Click to authorize action and lock replay.", "ok");
+      setStatus("consume-status", "Voice matched! Approved for next step — click to consume one-time token.", "ok");
     }
 
     async function consumeDecision() {
@@ -1528,11 +1627,21 @@
       } catch (err) { setStatus("consume-status", `Server Lock Enforced -> ${err.message}`, "err"); }
     }
 
+    function renderEnrolledTable(rows) {
+      const tbody = document.getElementById("enrolled-tbody");
+      if (!tbody) return;
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="5" class="small">No enrolled subjects yet.</td></tr>`; return; }
+      tbody.innerHTML = rows.map(r => {
+        const ts = r.created_at ? new Date(r.created_at).toISOString().replace("T", " ").slice(0, 19) : "--";
+        return `<tr><td><strong>${escapeHtml(r.subject_ref)}</strong></td><td>${escapeHtml(r.consent_ref)}</td><td>${Number(r.speech_seconds).toFixed(1)}s</td><td>${escapeHtml(String(r.audio_sha256 || "").slice(0, 14))}…</td><td>${escapeHtml(ts)}</td></tr>`;
+      }).join("");
+    }
+
     function renderAuditTable(rows) {
       const tbody = document.getElementById("audit-tbody");
       if (!rows.length) { tbody.innerHTML = `<tr><td colspan="6" class="small">No audit events recorded yet.</td></tr>`; return; }
       tbody.innerHTML = rows.slice(0, 25).map(r => {
-        const color = r.outcome === "PASS" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : r.outcome === "REJECT_REQUEST" ? "var(--error)" : "#9A6700";
+        const color = r.outcome === "APPROVED" || r.outcome === "TOKEN_CONSUMED" ? "var(--success)" : r.outcome === "REJECTED" ? "var(--error)" : "#9A6700";
         const ts = r.created_at ? new Date(r.created_at).toISOString().slice(11, 19) : "--";
         return `<tr><td>${escapeHtml(ts)}</td><td>${escapeHtml(r.sector)}</td><td>${escapeHtml(r.action)}</td><td style="color:${color};font-weight:700;">${escapeHtml(r.outcome)}</td><td>${escapeHtml((r.reason_codes || []).join(", ") || "—")}</td><td>${escapeHtml(String(r.session_id || "").slice(0, 8))}…</td></tr>`;
       }).join("");

@@ -177,24 +177,23 @@ def evaluate_voice_authorization(
 
     if session.expired:
         return AuthorizationDecision(
-            outcome="REJECT_REQUEST",
+            outcome="REJECTED",
             evidence_state="CHALLENGE_FAILED",
             reason_codes=["CHALLENGE_EXPIRED"],
             next_step_script=(
-                "This verification challenge has expired before completion. Please start a fresh "
-                "verification session and read the new challenge phrase."
+                "Request cancelled: this verification session has expired. Please start a fresh "
+                "verification session and submit voice again."
             ),
             emit_risk_alert=False,
         )
 
     if session.require_phrase_match and not phrase_match:
         return AuthorizationDecision(
-            outcome="REJECT_REQUEST",
+            outcome="REJECTED",
             evidence_state="CHALLENGE_FAILED",
             reason_codes=["CHALLENGE_MISMATCH"],
             next_step_script=(
-                "The spoken confirmation phrase did not match the active session challenge. "
-                "We cannot complete this request on the current recording; please retry with a fresh session."
+                "Request cancelled: the spoken confirmation phrase did not match the session challenge."
             ),
             emit_risk_alert=(session.sector == "telecom" and critical_action),
         )
@@ -214,12 +213,11 @@ def evaluate_voice_authorization(
         )
         reason_code = "AUDIO_QUALITY_LOW" if is_short_audio else "PROVIDER_UNAVAILABLE"
         return AuthorizationDecision(
-            outcome="REVIEW / HOLD",
+            outcome="REJECTED",
             evidence_state="INCONCLUSIVE_EVIDENCE",
             reason_codes=[reason_code],
             next_step_script=(
-                "Automated voice evidence is currently inconclusive for this request. "
-                "Please place the request on hold and complete an alternate out-of-band verification."
+                "Request cancelled: automated voice evidence could not be completed reliably (fail-closed)."
             ),
             emit_risk_alert=False,
         )
@@ -235,25 +233,12 @@ def evaluate_voice_authorization(
         if has_cross_domain_alert:
             reasons.append("CROSS_DOMAIN_ALERT")
 
-        if protective_low_friction:
-            return AuthorizationDecision(
-                outcome="STEP-UP",
-                evidence_state="SYNTHETIC_INDICATOR",
-                reason_codes=reasons,
-                next_step_script=(
-                    "Protective safety action noted, but voice authenticity checks returned an anomaly indicator. "
-                    "Please confirm via registered callback or OTP before finalizing."
-                ),
-                emit_risk_alert=False,
-            )
-
         return AuthorizationDecision(
-            outcome="REJECT_REQUEST",
+            outcome="REJECTED",
             evidence_state="SYNTHETIC_INDICATOR",
             reason_codes=reasons,
             next_step_script=(
-                "Voice checks flagged a synthetic audio indicator, so this action cannot be authorized by voice. "
-                "No accusation is implied; please direct the requester to in-person or alternate verified channels."
+                "Request cancelled: voice checks flagged a synthetic audio indicator, so this action cannot be authorized."
             ),
             emit_risk_alert=(session.sector == "telecom" and critical_action),
         )
@@ -268,25 +253,12 @@ def evaluate_voice_authorization(
         if session.sector == "helpdesk" and session.privileged_role:
             reasons.append("PRIVILEGED_APPROVAL_REQUIRED")
 
-        if protective_low_friction:
-            return AuthorizationDecision(
-                outcome="STEP-UP",
-                evidence_state="SPEAKER_NO_MATCH",
-                reason_codes=reasons,
-                next_step_script=(
-                    "Voiceprint evidence did not match the enrolled profile for this protective action. "
-                    "Please complete a quick registered-contact OTP or supervisor check to proceed."
-                ),
-                emit_risk_alert=False,
-            )
-
         return AuthorizationDecision(
-            outcome="REVIEW / HOLD",
+            outcome="REJECTED",
             evidence_state="SPEAKER_NO_MATCH",
             reason_codes=reasons,
             next_step_script=(
-                "Voiceprint evidence did not align with the enrolled reference sample. "
-                "Please hold the request and verify identity using an independent secondary channel."
+                "Request cancelled: voice did not match the enrolled speaker profile."
             ),
             emit_risk_alert=(session.sector == "telecom" and critical_action),
         )
@@ -294,10 +266,10 @@ def evaluate_voice_authorization(
     # Matrix cell: speaker_decision == "match" and deepfake_verdict == "real"
     if protective_low_friction:
         return AuthorizationDecision(
-            outcome="PASS",
+            outcome="APPROVED",
             evidence_state="ACOUSTIC_PASS",
             reason_codes=[],
-            next_step_script="Voice and challenge verification passed. Proceed immediately with the protective action.",
+            next_step_script="Voice matched and verified as genuine. Approved to proceed to the next step.",
             emit_risk_alert=False,
         )
 
@@ -317,12 +289,11 @@ def evaluate_voice_authorization(
 
     if has_cross_domain_alert:
         return AuthorizationDecision(
-            outcome="REVIEW / HOLD",
+            outcome="REJECTED",
             evidence_state="ACOUSTIC_PASS",
             reason_codes=step_up_reasons,
             next_step_script=(
-                "Voice evidence matched, however an active cross-domain SIM swap alert is present for this subject. "
-                "Hold the request for mandatory fraud-ops review and out-of-band confirmation."
+                "Request cancelled: an active cross-domain SIM swap alert blocks this subject."
             ),
             emit_risk_alert=False,
         )
@@ -333,16 +304,15 @@ def evaluate_voice_authorization(
             evidence_state="ACOUSTIC_PASS",
             reason_codes=step_up_reasons,
             next_step_script=(
-                "Voice evidence matched, and contextual policy controls require a secondary step-up approval "
-                "(manager sign-off, cooling hold, or high-value OTP) before releasing the action."
+                "Voice matched, and contextual policy controls require a secondary step-up approval before proceeding."
             ),
             emit_risk_alert=False,
         )
 
     return AuthorizationDecision(
-        outcome="PASS",
+        outcome="APPROVED",
         evidence_state="ACOUSTIC_PASS",
         reason_codes=[],
-        next_step_script="Acoustic, deepfake, and challenge checks all passed. One-time action token issued.",
+        next_step_script="Voice matched and verified as genuine. Approved to proceed to the next step.",
         emit_risk_alert=False,
     )

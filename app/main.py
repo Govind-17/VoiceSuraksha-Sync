@@ -192,6 +192,57 @@ def auth_me(actor: AuthActor | None = Depends(get_optional_actor)) -> dict[str, 
     return {"authenticated": True, "user": _actor_dict(actor)}
 
 
+def _enrollment_payload(record: Enrollment, duration_seconds: float | None = None) -> dict[str, Any]:
+    """Serialize an Enrollment row into the API response shape."""
+    payload: dict[str, Any] = {
+        "id": record.id,
+        "subject_ref": record.subject_ref,
+        "provider_speaker_id": record.provider_speaker_id,
+        "consent_ref": record.consent_ref,
+        "audio_sha256": record.audio_sha256,
+        "speech_seconds": record.speech_seconds,
+        "created_at": _as_utc(record.created_at).isoformat(),
+    }
+    if duration_seconds is not None:
+        payload["duration_seconds"] = duration_seconds
+    return payload
+
+
+async def _validate_and_enroll_wav(
+    *,
+    subject_ref: str,
+    consent_confirmed: bool,
+    file: UploadFile,
+    client: DetectifClient,
+) -> tuple[bytes, Any]:
+    """Validate speaker consent + 15-60s 16kHz PCM WAV and enroll via Eidos."""
+    if not consent_confirmed:
+        raise HTTPException(status_code=400, detail="Explicit speaker consent (consent_confirmed=true) is required.")
+
+    wav_bytes = await _read_bounded_wav(file)
+    if not wav_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded WAV file is empty.")
+
+    duration_s = _inspect_wav_duration(wav_bytes)
+    if duration_s is None:
+        raise HTTPException(status_code=400, detail="Invalid WAV file; 16kHz PCM WAV audio is required.")
+    if duration_s < MIN_ENROLL_SECONDS or duration_s > MAX_ENROLL_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Enrollment audio duration must be between 15 and 60 seconds (got {duration_s}s).",
+        )
+
+    try:
+        provider_res = client.enroll_speaker(speaker_id=subject_ref, wav_bytes=wav_bytes)
+    except DetectifProviderError as exc:
+        status = exc.status_code if exc.status_code in {400, 401, 403, 422, 429} else 502
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": exc.error_code, "message": exc.message, "request_id": exc.request_id},
+        ) from exc
+    return wav_bytes, provider_res
+
+
 @app.post("/api/v1/auth/register")
 def auth_register(
     body: RegisterRequest,
@@ -228,6 +279,76 @@ def auth_register(
     )
     set_session_cookie(response, create_session_token(actor))
     return {"authenticated": True, "user": _actor_dict(actor)}
+
+
+@app.post("/api/v1/auth/register-with-voice")
+async def auth_register_with_voice(
+    response: Response,
+    username: str = Form(..., min_length=3, max_length=64),
+    display_name: str = Form(..., min_length=2, max_length=100),
+    password: str = Form(..., min_length=6, max_length=128),
+    consent_confirmed: bool = Form(...),
+    consent_ref: str = Form("USER-REG-CONSENT-2026", min_length=2, max_length=128),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    client: DetectifClient = Depends(get_detectif_client),
+) -> dict[str, Any]:
+    """Register a new end-user account AND enroll their voiceprint atomically."""
+    clean_username = username.strip().lower()
+    clean_display = display_name.strip()
+    if len(clean_username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+    if len(clean_display) < 2:
+        raise HTTPException(status_code=400, detail="Full name must be at least 2 characters.")
+
+    admin_user, _ = get_admin_credentials()
+    if clean_username == admin_user.lower():
+        raise HTTPException(status_code=400, detail="Reserved username.")
+    if db.scalar(select(UserAccount).where(UserAccount.username == clean_username)) is not None:
+        raise HTTPException(status_code=409, detail="Username is already registered.")
+
+    subject_ref = _make_subject_ref(clean_username)
+    while db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref)) is not None:
+        subject_ref = _make_subject_ref(clean_username)
+
+    wav_bytes, provider_res = await _validate_and_enroll_wav(
+        subject_ref=subject_ref,
+        consent_confirmed=consent_confirmed,
+        file=file,
+        client=client,
+    )
+
+    account = UserAccount(
+        username=clean_username,
+        display_name=clean_display,
+        subject_ref=subject_ref,
+        password_hash=hash_password(password),
+    )
+    record = Enrollment(
+        subject_ref=subject_ref,
+        provider_speaker_id=provider_res.speaker_id,
+        consent_ref=consent_ref,
+        audio_sha256=hashlib.sha256(wav_bytes).hexdigest(),
+        speech_seconds=provider_res.speech_seconds,
+    )
+    db.add(account)
+    db.add(record)
+    db.commit()
+    db.refresh(account)
+    db.refresh(record)
+
+    actor = AuthActor(
+        username=account.username,
+        role="user",
+        display_name=account.display_name,
+        subject_ref=account.subject_ref,
+    )
+    set_session_cookie(response, create_session_token(actor))
+    return {
+        "authenticated": True,
+        "user": _actor_dict(actor),
+        "enrollment": _enrollment_payload(record, provider_res.duration_seconds),
+    }
 
 
 @app.post("/api/v1/auth/login")
@@ -424,33 +545,19 @@ async def create_enrollment(
     """Enroll a consented speaker voiceprint via Eidos; store SHA-256 hash only."""
     if actor.role != "admin" and subject_ref != actor.subject_ref:
         raise HTTPException(status_code=403, detail="Users may only enroll their own assigned subject_ref.")
-    if not consent_confirmed:
-        raise HTTPException(status_code=400, detail="Explicit speaker consent (consent_confirmed=true) is required.")
 
-    wav_bytes = await _read_bounded_wav(file)
-    if not wav_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded WAV file is empty.")
+    existing = db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
+    if actor.role != "admin" and existing is not None:
+        raise HTTPException(status_code=409, detail="Voiceprint is already enrolled for this account.")
 
-    duration_s = _inspect_wav_duration(wav_bytes)
-    if duration_s is None:
-        raise HTTPException(status_code=400, detail="Invalid WAV file; 16kHz PCM WAV audio is required.")
-    if duration_s < MIN_ENROLL_SECONDS or duration_s > MAX_ENROLL_SECONDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Enrollment audio duration must be between 15 and 60 seconds (got {duration_s}s).",
-        )
-
-    try:
-        provider_res = client.enroll_speaker(speaker_id=subject_ref, wav_bytes=wav_bytes)
-    except DetectifProviderError as exc:
-        status = exc.status_code if exc.status_code in {400, 401, 403, 422, 429} else 502
-        raise HTTPException(
-            status_code=status,
-            detail={"error_code": exc.error_code, "message": exc.message, "request_id": exc.request_id},
-        ) from exc
+    wav_bytes, provider_res = await _validate_and_enroll_wav(
+        subject_ref=subject_ref,
+        consent_confirmed=consent_confirmed,
+        file=file,
+        client=client,
+    )
 
     audio_digest = hashlib.sha256(wav_bytes).hexdigest()
-    existing = db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
     if existing is not None:
         existing.provider_speaker_id = provider_res.speaker_id
         existing.consent_ref = consent_ref
@@ -471,16 +578,7 @@ async def create_enrollment(
     db.refresh(record)
 
     return {
-        "enrollment": {
-            "id": record.id,
-            "subject_ref": record.subject_ref,
-            "provider_speaker_id": record.provider_speaker_id,
-            "consent_ref": record.consent_ref,
-            "audio_sha256": record.audio_sha256,
-            "speech_seconds": record.speech_seconds,
-            "duration_seconds": provider_res.duration_seconds,
-            "created_at": _as_utc(record.created_at).isoformat(),
-        },
+        "enrollment": _enrollment_payload(record, provider_res.duration_seconds),
         "provider": {
             "request_id": provider_res.request_id,
             "operation_id": provider_res.operation_id,
@@ -633,7 +731,14 @@ async def submit_verification_audio(
         active_risk_events=unexpired_risks,
     )
 
-    session.status = "EXPIRED" if is_expired else "COMPLETED"
+    if is_expired:
+        session.status = "EXPIRED"
+    elif evaluation.outcome == "APPROVED":
+        session.status = "APPROVED"
+    elif evaluation.outcome == "STEP-UP":
+        session.status = "STEP_UP"
+    else:
+        session.status = "CANCELLED"
 
     voice_row = VoiceResult(
         session_id=session.session_id,
@@ -655,7 +760,7 @@ async def submit_verification_audio(
     plaintext_token: str | None = None
     token_hash: str | None = None
     token_expires_at: datetime | None = None
-    if evaluation.outcome == "PASS":
+    if evaluation.outcome == "APPROVED":
         plaintext_token = secrets.token_urlsafe(32)
         token_hash = hash_text_sha256(plaintext_token)
         token_expires_at = now + timedelta(minutes=DECISION_TOKEN_TTL_MINUTES)
@@ -761,7 +866,7 @@ def consume_decision_token(
     if session is None or decision is None:
         raise HTTPException(status_code=404, detail="Decision not found for session.")
 
-    if decision.outcome != "PASS" or decision.token_hash is None:
+    if decision.outcome != "APPROVED" or decision.token_hash is None:
         raise HTTPException(status_code=409, detail=f"Decision outcome '{decision.outcome}' did not issue a consumable token.")
 
     if decision.consumed_at is not None:
