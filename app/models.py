@@ -119,3 +119,16 @@ class AuditEvent(Base):
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_codes_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class UserAccount(Base):
+    """Registered end-user account bound to a pseudonymous subject_ref."""
+
+    __tablename__ = "user_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

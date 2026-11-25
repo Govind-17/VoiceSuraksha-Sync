@@ -17,3 +17,9 @@ services:
         value: "false"
       - key: VOICESURAKSHA_DB_URL
         value: "sqlite:///./voicesuraksha.db"
+      - key: ADMIN_USERNAME
+        value: "admin"
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: AUTH_SECRET
+        generateValue: true

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import uuid
 import wave
@@ -15,16 +16,28 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.auth import (
+    AuthActor,
+    clear_session_cookie,
+    create_session_token,
+    get_admin_credentials,
+    get_current_actor,
+    get_optional_actor,
+    hash_password,
+    require_admin,
+    set_session_cookie,
+    verify_password,
+)
 from app.db import get_db, init_db
 from app.detectif_client import DetectifClient, DetectifProviderError
-from app.models import AuditEvent, Decision, Enrollment, RiskEvent, VerificationSession, VoiceResult, utcnow
+from app.models import AuditEvent, Decision, Enrollment, RiskEvent, UserAccount, VerificationSession, VoiceResult, utcnow
 from app.policy import (
     GATEWAY_PROFILES,
     SessionPolicyInput,
@@ -115,6 +128,31 @@ class ConsumeDecisionRequest(BaseModel):
     resource_ref: str
 
 
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    display_name: str = Field(..., min_length=2, max_length=128)
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+def _actor_dict(actor: AuthActor) -> dict[str, Any]:
+    return {
+        "username": actor.username,
+        "role": actor.role,
+        "display_name": actor.display_name,
+        "subject_ref": actor.subject_ref,
+    }
+
+
+def _make_subject_ref(username: str) -> str:
+    slug = re.sub(r"[^A-Z0-9]", "", username.upper())[:8] or "USER"
+    return f"SUB-{slug}-{secrets.token_hex(2).upper()}"
+
+
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 def serve_frontend():
     """Serve the single-file SOC UI directly at '/'."""
@@ -126,29 +164,178 @@ def serve_frontend():
 
 
 @app.api_route("/api/v1/health", methods=["GET", "HEAD"])
-def health(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Return gateway operational mode, available profiles, and enrolled speaker count."""
+def health(
+    db: Session = Depends(get_db),
+    actor: AuthActor | None = Depends(get_optional_actor),
+) -> dict[str, Any]:
+    """Return gateway operational mode and available profiles (enrolled count only when authenticated)."""
     demo_mode = os.getenv("DEMO_MODE", "false").lower() == "true"
-    enrolled_count = db.query(Enrollment).count()
-    return {
+    payload: dict[str, Any] = {
         "status": "ok",
         "service": "voicelock-gateway",
         "mode": "DEMO" if demo_mode else "LIVE",
         "profiles": list(GATEWAY_PROFILES.keys()),
-        "enrolled_count": enrolled_count,
+    }
+    if actor is not None:
+        if actor.role == "admin":
+            payload["enrolled_count"] = db.query(Enrollment).count()
+        elif actor.subject_ref:
+            payload["enrolled_count"] = db.query(Enrollment).filter(Enrollment.subject_ref == actor.subject_ref).count()
+    return payload
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(actor: AuthActor | None = Depends(get_optional_actor)) -> dict[str, Any]:
+    """Return current authenticated session actor, or authenticated=False."""
+    if actor is None:
+        return {"authenticated": False, "user": None}
+    return {"authenticated": True, "user": _actor_dict(actor)}
+
+
+@app.post("/api/v1/auth/register")
+def auth_register(
+    body: RegisterRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Register a new end-user account bound to a unique pseudonymous subject_ref."""
+    clean_username = body.username.strip().lower()
+    admin_user, _ = get_admin_credentials()
+    if clean_username == admin_user.lower():
+        raise HTTPException(status_code=400, detail="Reserved username.")
+    if db.scalar(select(UserAccount).where(UserAccount.username == clean_username)) is not None:
+        raise HTTPException(status_code=409, detail="Username is already registered.")
+
+    subject_ref = _make_subject_ref(clean_username)
+    while db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref)) is not None:
+        subject_ref = _make_subject_ref(clean_username)
+
+    account = UserAccount(
+        username=clean_username,
+        display_name=body.display_name.strip(),
+        subject_ref=subject_ref,
+        password_hash=hash_password(body.password),
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+
+    actor = AuthActor(
+        username=account.username,
+        role="user",
+        display_name=account.display_name,
+        subject_ref=account.subject_ref,
+    )
+    set_session_cookie(response, create_session_token(actor))
+    return {"authenticated": True, "user": _actor_dict(actor)}
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(
+    body: LoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticate an admin or registered user and issue an HttpOnly session cookie."""
+    clean_username = body.username.strip()
+    admin_user, admin_pass = get_admin_credentials()
+
+    if clean_username == admin_user and secrets.compare_digest(body.password, admin_pass):
+        actor = AuthActor(
+            username=admin_user,
+            role="admin",
+            display_name="SOC Administrator",
+            subject_ref=None,
+        )
+        set_session_cookie(response, create_session_token(actor))
+        return {"authenticated": True, "user": _actor_dict(actor)}
+
+    account = db.scalar(select(UserAccount).where(UserAccount.username == clean_username.lower()))
+    if account is None or not verify_password(body.password, account.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    actor = AuthActor(
+        username=account.username,
+        role="user",
+        display_name=account.display_name,
+        subject_ref=account.subject_ref,
+    )
+    set_session_cookie(response, create_session_token(actor))
+    return {"authenticated": True, "user": _actor_dict(actor)}
+
+
+@app.post("/api/v1/auth/logout")
+def auth_logout(response: Response) -> dict[str, Any]:
+    """Clear the active authentication cookie."""
+    clear_session_cookie(response)
+    return {"authenticated": False}
+
+
+@app.get("/api/v1/user/overview")
+def user_overview(
+    db: Session = Depends(get_db),
+    actor: AuthActor = Depends(get_current_actor),
+) -> dict[str, Any]:
+    """Return the logged-in user's own enrollment and verification history."""
+    if not actor.subject_ref:
+        return {"enrollment": None, "verifications": []}
+
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == actor.subject_ref))
+    sessions = db.scalars(
+        select(VerificationSession)
+        .where(VerificationSession.subject_ref == actor.subject_ref)
+        .order_by(VerificationSession.expires_at.desc())
+        .limit(20)
+    ).all()
+    history: list[dict[str, Any]] = []
+    for s in sessions:
+        dec = db.scalar(select(Decision).where(Decision.session_id == s.session_id))
+        history.append(
+            {
+                "session_id": s.session_id,
+                "sector": s.sector,
+                "action": s.action,
+                "resource_ref": s.resource_ref,
+                "status": s.status,
+                "outcome": dec.outcome if dec else "PENDING",
+                "reason_codes": json.loads(dec.reason_codes_json) if dec else [],
+                "next_step_script": dec.next_step_script if dec else "",
+                "expires_at": _as_utc(s.expires_at).isoformat(),
+            }
+        )
+
+    return {
+        "enrollment": (
+            {
+                "subject_ref": enrollment.subject_ref,
+                "consent_ref": enrollment.consent_ref,
+                "audio_sha256": enrollment.audio_sha256,
+                "speech_seconds": enrollment.speech_seconds,
+                "created_at": _as_utc(enrollment.created_at).isoformat(),
+            }
+            if enrollment
+            else None
+        ),
+        "verifications": history,
     }
 
 
 @app.get("/api/v1/profiles")
-def list_profiles() -> dict[str, Any]:
+def list_profiles(_actor: AuthActor = Depends(get_current_actor)) -> dict[str, Any]:
     """Return the 4 configured GATEWAY_PROFILES."""
     return {"profiles": GATEWAY_PROFILES}
 
 
 @app.get("/api/v1/enrollments")
-def list_enrollments(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """List pseudonymous speaker enrollments (metadata only)."""
-    rows = db.scalars(select(Enrollment).order_by(Enrollment.created_at.desc())).all()
+def list_enrollments(
+    db: Session = Depends(get_db),
+    actor: AuthActor = Depends(get_current_actor),
+) -> dict[str, Any]:
+    """List pseudonymous speaker enrollments (scoped to own subject_ref for standard users)."""
+    stmt = select(Enrollment).order_by(Enrollment.created_at.desc())
+    if actor.role != "admin":
+        stmt = stmt.where(Enrollment.subject_ref == actor.subject_ref)
+    rows = db.scalars(stmt).all()
     return {
         "enrollments": [
             {
@@ -166,8 +353,11 @@ def list_enrollments(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @app.get("/api/v1/audit")
-def list_audit(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """List immutable audit trail records."""
+def list_audit(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """List immutable audit trail records (admin only)."""
     rows = db.scalars(select(AuditEvent).order_by(AuditEvent.id.desc())).all()
     return {
         "audit_events": [
@@ -186,8 +376,11 @@ def list_audit(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @app.get("/api/v1/risk-events")
-def list_risk_events(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """List cross-domain risk events (e.g., simulated SIM_SWAP_ATTEMPT_BLOCKED)."""
+def list_risk_events(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """List cross-domain risk events (admin only)."""
     rows = db.scalars(select(RiskEvent).order_by(RiskEvent.id.desc())).all()
     return {
         "risk_events": [
@@ -208,8 +401,11 @@ def list_risk_events(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 @app.post("/api/v1/demo/clear-alerts")
-def clear_demo_alerts(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Clear active RiskEvent rows for demo reset while keeping enrolled Eidos speakers intact."""
+def clear_demo_alerts(
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Clear active RiskEvent rows for demo reset (admin only)."""
     result = db.execute(delete(RiskEvent).where(RiskEvent.risk_state == "ACTIVE"))
     db.commit()
     return {"status": "ok", "cleared_count": result.rowcount or 0}
@@ -223,8 +419,11 @@ async def create_enrollment(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
+    actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
     """Enroll a consented speaker voiceprint via Eidos; store SHA-256 hash only."""
+    if actor.role != "admin" and subject_ref != actor.subject_ref:
+        raise HTTPException(status_code=403, detail="Users may only enroll their own assigned subject_ref.")
     if not consent_confirmed:
         raise HTTPException(status_code=400, detail="Explicit speaker consent (consent_confirmed=true) is required.")
 
@@ -295,8 +494,11 @@ async def create_enrollment(
 def create_verification_session(
     body: CreateSessionRequest,
     db: Session = Depends(get_db),
+    actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
-    """Create a short-lived action-bound verification session with a random challenge phrase."""
+    """Create a short-lived action-bound verification session."""
+    if actor.role != "admin" and body.subject_ref != actor.subject_ref:
+        raise HTTPException(status_code=403, detail="Users may only verify their own assigned subject_ref.")
     try:
         validate_sector_action(body.sector, body.action)
     except ValueError as exc:
@@ -350,11 +552,14 @@ async def submit_verification_audio(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     client: DetectifClient = Depends(get_detectif_client),
+    actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
     """Call DetectifAI Eidos+Aletheia to verify voice, evaluate policy, and issue one-time token on PASS."""
     session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))
     if session is None:
         raise HTTPException(status_code=404, detail="Verification session not found.")
+    if actor.role != "admin" and session.subject_ref != actor.subject_ref:
+        raise HTTPException(status_code=403, detail="Cannot submit audio for another user's session.")
 
     if session.status != "PENDING":
         raise HTTPException(status_code=409, detail=f"Session '{session_id}' has already been processed ({session.status}).")
@@ -499,6 +704,22 @@ async def submit_verification_audio(
     db.add(audit_row)
     db.commit()
 
+    if actor.role != "admin":
+        return {
+            "session_id": session.session_id,
+            "status": session.status,
+            "phrase_match": phrase_match,
+            "evidence_state": evaluation.evidence_state,
+            "outcome": evaluation.outcome,
+            "reason_codes": evaluation.reason_codes,
+            "next_step_script": evaluation.next_step_script,
+            "voice_summary": {
+                "speaker_decision": voice_row.speaker_decision,
+                "deepfake_verdict": voice_row.deepfake_verdict,
+                "latency_ms": voice_row.latency_ms,
+            },
+        }
+
     return {
         "session_id": session.session_id,
         "status": session.status,
@@ -532,6 +753,7 @@ def consume_decision_token(
     session_id: str,
     body: ConsumeDecisionRequest,
     db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
 ) -> dict[str, Any]:
     """Validate and atomically consume a one-time decision token bound to session/action/resource."""
     session = db.scalar(select(VerificationSession).where(VerificationSession.session_id == session_id))

@@ -59,7 +59,7 @@ def make_mock_client(handler) -> DetectifClient:
 
 @pytest.fixture()
 def make_test_client(db_session_factory):
-    def _factory(mock_handler):
+    def _factory(mock_handler, *, auto_login_admin: bool = True):
         def _override_get_db():
             db = db_session_factory()
             try:
@@ -69,7 +69,14 @@ def make_test_client(db_session_factory):
 
         app.dependency_overrides[get_db] = _override_get_db
         app.dependency_overrides[get_detectif_client] = lambda: make_mock_client(mock_handler)
-        return TestClient(app)
+        client = TestClient(app)
+        if auto_login_admin:
+            from app.auth import get_admin_credentials
+
+            admin_u, admin_p = get_admin_credentials()
+            login_resp = client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+            assert login_resp.status_code == 200, login_resp.text
+        return client
 
     yield _factory
     app.dependency_overrides.clear()
@@ -633,3 +640,102 @@ def test_render_readiness_head_health_and_upload_limit(make_test_client):
         files={"file": ("huge.wav", oversized, "audio/wav")},
     )
     assert resp.status_code == 413
+
+
+def test_unauthenticated_blocked_while_health_and_ui_public(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    assert client.get("/").status_code == 200
+    health = client.get("/api/v1/health")
+    assert health.status_code == 200
+    assert "enrolled_count" not in health.json()
+    assert client.get("/api/v1/auth/me").json() == {"authenticated": False, "user": None}
+
+    assert client.get("/api/v1/profiles").status_code == 401
+    assert client.get("/api/v1/enrollments").status_code == 401
+    assert client.get("/api/v1/audit").status_code == 401
+    assert client.get("/api/v1/risk-events").status_code == 401
+    assert client.get("/api/v1/user/overview").status_code == 401
+    assert client.post("/api/v1/demo/clear-alerts").status_code == 401
+
+
+def test_user_register_login_and_strict_isolation(make_test_client):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler, auto_login_admin=False)
+
+    # Register Alice
+    reg_a = client.post(
+        "/api/v1/auth/register",
+        json={"username": "alice", "display_name": "Alice Rao", "password": "secret123"},
+    )
+    assert reg_a.status_code == 200, reg_a.text
+    alice = reg_a.json()["user"]
+    assert alice["role"] == "user"
+    alice_sub = alice["subject_ref"]
+
+    # User cannot access admin endpoints or another subject_ref
+    assert client.get("/api/v1/audit").status_code == 403
+    assert client.get("/api/v1/risk-events").status_code == 403
+    assert client.post("/api/v1/demo/clear-alerts").status_code == 403
+    assert (
+        client.post(
+            "/api/v1/enrollments",
+            data={"subject_ref": "SUB-OTHER", "consent_confirmed": "true", "consent_ref": "C-1"},
+            files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+        ).status_code
+        == 403
+    )
+
+    # Alice enrolls & verifies her own voice
+    _enroll_subject(client, alice_sub)
+    sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": alice_sub, "action": "sim_replacement", "resource_ref": "SIM-ALICE-1"},
+    )
+    assert sess.status_code == 200
+    alice_sid = sess.json()["session_id"]
+
+    ver = client.post(
+        f"/api/v1/verification-sessions/{alice_sid}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    )
+    assert ver.status_code == 200
+    ver_json = ver.json()
+    assert ver_json["outcome"] == "PASS"
+    assert "decision_token" not in ver_json
+    assert ver_json["voice_summary"]["speaker_decision"] == "match"
+
+    overview = client.get("/api/v1/user/overview").json()
+    assert overview["enrollment"]["subject_ref"] == alice_sub
+    assert len(overview["verifications"]) == 1
+
+    # Logout and register Bob: Bob cannot see Alice's data or touch Alice's session
+    client.post("/api/v1/auth/logout")
+    reg_b = client.post(
+        "/api/v1/auth/register",
+        json={"username": "bob", "display_name": "Bob Nair", "password": "secret456"},
+    )
+    assert reg_b.status_code == 200
+    assert client.get("/api/v1/enrollments").json()["enrollments"] == []
+    assert client.get("/api/v1/user/overview").json()["verifications"] == []
+    assert (
+        client.post(
+            f"/api/v1/verification-sessions/{alice_sid}/audio",
+            data={"spoken_transcript": ""},
+            files={"file": ("verify.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+        ).status_code
+        == 403
+    )
+
+    # Admin login sees everything
+    from app.auth import get_admin_credentials
+
+    admin_u, admin_p = get_admin_credentials()
+    client.post("/api/v1/auth/logout")
+    adm = client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+    assert adm.status_code == 200
+    assert adm.json()["user"]["role"] == "admin"
+    assert len(client.get("/api/v1/enrollments").json()["enrollments"]) == 1
+    assert len(client.get("/api/v1/audit").json()["audit_events"]) == 1
