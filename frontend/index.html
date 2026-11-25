@@ -424,44 +424,14 @@
       </div>
 
       <div class="ws-grid">
-        <!-- User Left Column: Saved Voiceprint Status (or fallback Enroll) + Request -->
+        <!-- User Left Column: Saved Voiceprint Status + Request -->
         <div class="col">
-          <div class="card hidden" id="user-voice-saved-card">
+          <div class="card" id="user-voice-saved-card">
             <div class="card-hdr">
-              <div class="card-title"><span class="step-tag">MY VOICE</span> Account Voiceprint Saved</div>
+              <div class="card-title"><span class="step-tag">MY VOICE</span> Account Voiceprint Status</div>
               <span class="pill ok" id="user-saved-secs">ACTIVE</span>
             </div>
-            <div class="status-line ok" id="user-voice-saved-summary">Voiceprint already saved on your account. No re-enrollment required on login.</div>
-          </div>
-
-          <div class="card hidden" id="user-enroll-card">
-            <div class="card-hdr">
-              <div class="card-title"><span class="step-tag">MY VOICE</span> Consent-Gated Voiceprint Enrollment</div>
-              <span class="pill" id="user-enroll-timer">0.0s / 15–60s</span>
-            </div>
-            <div class="form-grid">
-              <div>
-                <label>My Assigned Subject ID</label>
-                <input type="text" id="u-enroll-subject" readonly />
-              </div>
-              <div>
-                <label for="u-enroll-consent-ref">Consent Reference</label>
-                <input type="text" id="u-enroll-consent-ref" value="USER-CONSENT-2026" />
-              </div>
-            </div>
-            <label class="check-row">
-              <input type="checkbox" id="u-enroll-consent" />
-              <span>I consent to voiceprint enrollment (SHA-256 digest &amp; Eidos speaker ref only — raw audio is never stored).</span>
-            </label>
-            <div class="btn-row" style="margin-bottom:10px;">
-              <button class="btn btn-ghost btn-sm" id="btn-rec-user-enroll" onclick="toggleMic('user-enroll')">Record Enrollment (15–60s)</button>
-              <input type="file" id="file-user-enroll" accept=".wav,audio/wav" onchange="onFilePicked('user-enroll')" />
-            </div>
-            <div class="btn-row">
-              <button class="btn btn-primary btn-sm" onclick="submitUserEnrollment()">Save My Voiceprint</button>
-              <span class="small" id="u-enroll-file-info">No WAV captured yet</span>
-            </div>
-            <div class="status-line" id="u-enroll-status">Enroll once with 15–60s of your voice to enable verification.</div>
+            <div class="status-line ok" id="user-voice-saved-summary">Voiceprint saved during account registration. No re-enrollment required on login.</div>
           </div>
 
           <div class="card">
@@ -849,7 +819,6 @@
         "reg-enroll": null,
         "admin-enroll": null,
         "admin-verify": null,
-        "user-enroll": null,
         "user-verify": null
       },
       rec: {
@@ -1025,7 +994,6 @@
       } else {
         document.getElementById("user-welcome-name").textContent = user.display_name || user.username;
         document.getElementById("user-subject-badge").textContent = user.subject_ref;
-        document.getElementById("u-enroll-subject").value = user.subject_ref;
         populateUserActions();
         await refreshUserDashboard();
         drawIdleWaveform("u-waveform-canvas");
@@ -1111,7 +1079,6 @@
       "reg-enroll":   { btn: "btn-rec-reg-enroll", pill: "reg-enroll-timer", info: "reg-enroll-file-info", status: "reg-enroll-status", enroll: true, idleLabel: "Record Voiceprint (15–60s)" },
       "admin-enroll": { btn: "btn-rec-enroll", pill: "enroll-timer-pill", info: "enroll-file-info", status: "enroll-status", enroll: true, idleLabel: "Start Enrollment Mic (15–60s)" },
       "admin-verify": { btn: "btn-rec-verify", pill: "verify-timer-pill", info: "verify-file-info", status: "verify-status", enroll: false, canvas: "waveform-canvas", idleLabel: "Start Live Voice Mic (8–15s)" },
-      "user-enroll":  { btn: "btn-rec-user-enroll", pill: "user-enroll-timer", info: "u-enroll-file-info", status: "u-enroll-status", enroll: true, idleLabel: "Record Enrollment (15–60s)" },
       "user-verify":  { btn: "btn-rec-user-verify", pill: "user-verify-timer", info: "u-verify-file-info", status: "u-verify-status", enroll: false, canvas: "u-waveform-canvas", idleLabel: "Start Live Mic (8–15s)" }
     };
 
@@ -1176,7 +1143,6 @@
         "reg-enroll": "file-reg-enroll",
         "admin-enroll": "file-enroll",
         "admin-verify": "file-verify",
-        "user-enroll": "file-user-enroll",
         "user-verify": "file-user-verify"
       }[target];
       const input = document.getElementById(inputId);
@@ -1206,26 +1172,30 @@
       try {
         const data = await apiJson("/api/v1/user/overview");
         const badge = document.getElementById("user-enroll-badge");
-        const enrollCard = document.getElementById("user-enroll-card");
-        const savedCard = document.getElementById("user-voice-saved-card");
+        const savedSecs = document.getElementById("user-saved-secs");
         const isEnrolled = Boolean(data.enrollment);
-
-        enrollCard.classList.toggle("hidden", isEnrolled);
-        savedCard.classList.toggle("hidden", !isEnrolled);
 
         if (isEnrolled) {
           const secs = Number(data.enrollment.speech_seconds).toFixed(1);
           badge.className = "pill ok";
           badge.textContent = `VOICEPRINT SAVED (${secs}s)`;
-          document.getElementById("user-saved-secs").textContent = `${secs}s ENROLLED`;
+          savedSecs.className = "pill ok";
+          savedSecs.textContent = `${secs}s ENROLLED`;
           setStatus(
             "user-voice-saved-summary",
-            `Saved on account for ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...). Re-enrollment is skipped on login — submit a verification request below.`,
+            `Saved on account for ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...). Re-enrollment is never requested on login — submit a verification request below.`,
             "ok"
           );
         } else {
           badge.className = "pill warn";
-          badge.textContent = "NOT ENROLLED YET";
+          badge.textContent = "NO VOICEPRINT ON ACCOUNT";
+          savedSecs.className = "pill warn";
+          savedSecs.textContent = "MISSING";
+          setStatus(
+            "user-voice-saved-summary",
+            "No voiceprint is linked to this account. Register a new account (voiceprint is enrolled at registration) or contact Admin SOC.",
+            "warn"
+          );
         }
         const tbody = document.getElementById("u-history-tbody");
         const rows = data.verifications || [];
@@ -1239,26 +1209,6 @@
         }
       } catch (err) {
         setStatus("u-verify-status", err.message, "err");
-      }
-    }
-
-    async function submitUserEnrollment() {
-      const subjectRef = document.getElementById("u-enroll-subject").value.trim();
-      const consentRef = document.getElementById("u-enroll-consent-ref").value.trim();
-      const consentOk = document.getElementById("u-enroll-consent").checked;
-      if (!consentOk) { setStatus("u-enroll-status", "Confirm consent before enrolling.", "err"); return; }
-      if (!state.blobs["user-enroll"]) { setStatus("u-enroll-status", "Record or upload a 15–60s WAV file first.", "warn"); return; }
-      const fd = new FormData();
-      fd.append("subject_ref", subjectRef);
-      fd.append("consent_confirmed", "true");
-      fd.append("consent_ref", consentRef || "USER-CONSENT");
-      fd.append("file", state.blobs["user-enroll"], "enroll.wav");
-      setStatus("u-enroll-status", "Enrolling your voiceprint...", "");
-      try {
-        await apiJson("/api/v1/enrollments", { method: "POST", body: fd });
-        await refreshUserDashboard();
-      } catch (err) {
-        setStatus("u-enroll-status", err.message, "err");
       }
     }
 
