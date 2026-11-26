@@ -81,20 +81,20 @@
       color: #28CB8B; background: rgba(40, 203, 139, 0.1); border-color: rgba(40, 203, 139, 0.28);
     }
     .nav-actions { display: flex; align-items: center; gap: 7px; flex-wrap: nowrap; justify-content: flex-end; }
-    .navbar .pill, .soc-ribbon .pill {
+    .navbar .pill, .soc-sidebar .pill {
       background: rgba(255, 255, 255, 0.06); border-color: rgba(148, 163, 184, 0.28);
-      color: #E2E8F0; padding: 4px 10px; font-size: 10.5px; white-space: nowrap; flex-shrink: 0;
+      color: #E2E8F0; padding: 5px 10px; font-size: 10.5px; white-space: nowrap; flex-shrink: 0;
     }
-    .navbar .pill.ok, .soc-ribbon .pill.ok { background: rgba(40, 203, 139, 0.14); border-color: rgba(40, 203, 139, 0.45); color: #34D399; }
-    .navbar .pill.info, .soc-ribbon .pill.info { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.42); color: #7DD3FC; }
-    .navbar .pill.warn, .soc-ribbon .pill.warn { background: rgba(251, 192, 45, 0.14); border-color: rgba(251, 192, 45, 0.45); color: #FCD34D; }
-    .navbar .pill.bad, .soc-ribbon .pill.bad { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.48); color: #FCA5A5; }
-    .navbar .btn-nav-ghost, .soc-ribbon .btn-nav-ghost {
+    .navbar .pill.ok, .soc-sidebar .pill.ok { background: rgba(40, 203, 139, 0.14); border-color: rgba(40, 203, 139, 0.45); color: #34D399; }
+    .navbar .pill.info, .soc-sidebar .pill.info { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.42); color: #7DD3FC; }
+    .navbar .pill.warn, .soc-sidebar .pill.warn { background: rgba(251, 192, 45, 0.14); border-color: rgba(251, 192, 45, 0.45); color: #FCD34D; }
+    .navbar .pill.bad, .soc-sidebar .pill.bad { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.48); color: #FCA5A5; }
+    .navbar .btn-nav-ghost, .soc-sidebar .btn-nav-ghost {
       background: rgba(255, 255, 255, 0.06); color: #E2E8F0; border: 1px solid rgba(40, 203, 139, 0.35);
-      padding: 5px 11px; border-radius: 6px; font-size: 11.5px; font-family: var(--mono); font-weight: 500;
+      padding: 6px 11px; border-radius: 6px; font-size: 11.5px; font-family: var(--mono); font-weight: 500;
       cursor: pointer; white-space: nowrap; flex-shrink: 0;
     }
-    .navbar .btn-nav-ghost:hover:not(:disabled), .soc-ribbon .btn-nav-ghost:hover:not(:disabled) {
+    .navbar .btn-nav-ghost:hover:not(:disabled), .soc-sidebar .btn-nav-ghost:hover:not(:disabled) {
       border-color: #28CB8B; color: #28CB8B; background: rgba(40, 203, 139, 0.12);
     }
     .navbar .btn-nav-logout {
@@ -361,33 +361,92 @@
     .footer-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 32px; align-items: center; }
     @media (max-width: 760px) { .footer-grid { grid-template-columns: 1fr; } }
 
-    /* Obsidian SOC Finals Upgrades */
-    .soc-ribbon {
-      background: linear-gradient(135deg, #0F171E 0%, #1C262B 100%);
-      border-bottom: 1px solid rgba(40, 203, 139, 0.32);
-      box-shadow: 0 8px 24px rgba(15, 23, 30, 0.18);
-      padding: 12px 0;
-      color: #E2E8F0;
+    /* Obsidian SOC Finals Upgrades & Sidebar */
+    .navbar .container { max-width: 1440px; }
+    .admin-shell {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      align-items: start;
     }
-    .soc-ribbon .container, .navbar .container { max-width: 1440px; }
-    .soc-ribbon-inner {
-      display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    .soc-sidebar {
+      position: sticky;
+      top: 70px;
+      height: calc(100vh - 70px);
+      overflow-y: auto;
+      background: linear-gradient(180deg, #0F171E 0%, #162027 100%);
+      border-right: 1px solid rgba(40, 203, 139, 0.32);
+      box-shadow: 4px 0 24px rgba(15, 23, 30, 0.16);
+      padding: 18px 14px 24px;
+      color: #E2E8F0;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      z-index: 20;
+    }
+    .admin-main { min-width: 0; }
+    .soc-sidebar-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .soc-sidebar-title {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #64748B;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+    }
+    .soc-sidebar-status {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .soc-sidebar-status .pill {
+      width: 100%;
+      justify-content: flex-start;
+      border-radius: 7px;
+      white-space: normal;
+      line-height: 1.35;
+    }
+    .soc-sidebar-status #enrolled-pill,
+    .soc-sidebar-status #active-alerts-pill {
+      justify-content: space-between;
+    }
+    .soc-sidebar-status .btn-nav-ghost {
+      width: 100%;
+      text-align: center;
+      margin-top: 2px;
     }
     .soc-metrics-group {
-      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-start;
-    }
-    .soc-queue-right {
-      display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; margin-left: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
     .soc-metric-tile {
-      display: flex; align-items: center; gap: 10px; white-space: nowrap;
-      padding: 7px 12px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 9px 12px; border-radius: 8px;
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(40, 203, 139, 0.22);
     }
     .soc-metric-lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: #94A3B8; font-family: var(--mono); }
-    .soc-metric-val { font-family: var(--mono); font-size: 15px; font-weight: 700; color: #28CB8B; }
+    .soc-metric-val { font-family: var(--mono); font-size: 14.5px; font-weight: 700; color: #28CB8B; white-space: nowrap; }
     .soc-metric-val.bad { color: #FF6B6B; }
+    @media (max-width: 1120px) {
+      .admin-shell { grid-template-columns: 1fr; }
+      .soc-sidebar {
+        position: static;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid rgba(40, 203, 139, 0.32);
+      }
+      .soc-sidebar-status { flex-direction: row; flex-wrap: wrap; }
+      .soc-sidebar-status .pill,
+      .soc-sidebar-status .btn-nav-ghost { width: auto; }
+      .soc-metrics-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); }
+    }
     .btn-obsidian-ghost {
       background: rgba(255, 255, 255, 0.06); color: #E2E8F0;
       border: 1px solid rgba(40, 203, 139, 0.35);
@@ -695,48 +754,43 @@
 
   <!-- VIEW 2: ADMIN SOC DASHBOARD (visible ONLY when logged in as admin) -->
   <div id="admin-dashboard" class="hidden">
-    <!-- Live Metrics Ribbon -->
-    <div class="soc-ribbon">
-      <div class="container soc-ribbon-inner">
-        <div class="soc-metrics-group">
-          <div class="soc-metric-tile">
-            <div>
+    <div class="admin-shell">
+      <aside class="soc-sidebar" id="soc-sidebar" aria-label="SOC Telemetry and System Status">
+        <div class="soc-sidebar-section">
+          <div class="soc-sidebar-title">Gateway Status</div>
+          <div class="soc-sidebar-status" id="soc-sidebar-status">
+            <span class="pill" id="active-alerts-pill" style="background:rgba(40,203,139,0.14);border-color:rgba(40,203,139,0.4);color:#28CB8B;">ACTIVE ALERTS: <strong id="metric-active-alerts">0</strong></span>
+          </div>
+        </div>
+        <div class="soc-sidebar-section">
+          <div class="soc-sidebar-title">Live Telemetry</div>
+          <div class="soc-metrics-group">
+            <div class="soc-metric-tile">
               <div class="soc-metric-lbl">Total Checks</div>
               <div class="soc-metric-val" id="metric-total-checks">0</div>
             </div>
-          </div>
-          <div class="soc-metric-tile">
-            <div>
+            <div class="soc-metric-tile">
               <div class="soc-metric-lbl">Real p50 Latency</div>
               <div class="soc-metric-val" id="metric-p50-latency">-- ms</div>
             </div>
-          </div>
-          <div class="soc-metric-tile">
-            <div>
+            <div class="soc-metric-tile">
               <div class="soc-metric-lbl">Blocked Threats</div>
               <div class="soc-metric-val bad" id="metric-blocked-threats">0</div>
             </div>
-          </div>
-          <div class="soc-metric-tile">
-            <div>
+            <div class="soc-metric-tile">
               <div class="soc-metric-lbl">Decisions / min</div>
               <div class="soc-metric-val" id="metric-decisions-per-min">0.0</div>
             </div>
-          </div>
-          <div class="soc-metric-tile">
-            <div>
+            <div class="soc-metric-tile">
               <div class="soc-metric-lbl">p95 Latency</div>
               <div class="soc-metric-val" id="metric-p95-latency">-- ms</div>
             </div>
           </div>
         </div>
-        <div class="soc-queue-right" id="soc-queue-right">
-          <span class="pill" style="background:rgba(40,203,139,0.14);border-color:rgba(40,203,139,0.4);color:#28CB8B;">ACTIVE ALERTS: <strong id="metric-active-alerts">0</strong></span>
-        </div>
-      </div>
-    </div>
+      </aside>
 
-    <section class="hero" id="admin-hero">
+      <div class="admin-main">
+        <section class="hero" id="admin-hero">
       <div class="container">
         <div class="hero-grid">
           <div>
@@ -1153,6 +1207,8 @@
         </details>
       </div>
     </section>
+      </div>
+    </div>
   </div>
 
   <footer>
@@ -1378,17 +1434,19 @@
       if (mobileDrawer) mobileDrawer.classList.add("hidden");
 
       const navSlot = document.getElementById("nav-right-slot");
-      const queueSlot = document.getElementById("soc-queue-right");
-      const queueIds = ["health-pill", "role-pill", "storage-pill", "enrolled-pill", "sim-pill", "btn-clear-alerts"];
-      if (isAdmin && queueSlot) {
-        const alertAnchor = queueSlot.firstElementChild;
-        for (const id of queueIds) {
+      const sidebarStatusSlot = document.getElementById("soc-sidebar-status");
+      const alertsAnchor = document.getElementById("active-alerts-pill");
+      const statusIds = ["health-pill", "role-pill", "storage-pill", "enrolled-pill", "sim-pill"];
+      if (isAdmin && sidebarStatusSlot) {
+        for (const id of statusIds) {
           const node = document.getElementById(id);
-          if (node) queueSlot.insertBefore(node, alertAnchor || null);
+          if (node) sidebarStatusSlot.insertBefore(node, alertsAnchor || null);
         }
+        const clearBtn = document.getElementById("btn-clear-alerts");
+        if (clearBtn) sidebarStatusSlot.appendChild(clearBtn);
       } else if (navSlot) {
         const logoutBtn = document.getElementById("btn-logout");
-        for (const id of queueIds) {
+        for (const id of [...statusIds, "btn-clear-alerts"]) {
           const node = document.getElementById(id);
           if (node) navSlot.insertBefore(node, logoutBtn || null);
         }
