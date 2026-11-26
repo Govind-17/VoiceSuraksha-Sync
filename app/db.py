@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def get_database_url() -> str:
@@ -100,6 +100,7 @@ def run_schema_migrations(target_engine=None) -> None:
         "verification_sessions": [
             ("parent_session_id", "VARCHAR(64)"),
             ("challenge_attempt", "INTEGER NOT NULL DEFAULT 1"),
+            ("challenge_mode", "VARCHAR(32) NOT NULL DEFAULT 'phrase'"),
             ("sim_age_days", "INTEGER"),
             ("device_changed", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
             ("call_velocity_1h", "INTEGER NOT NULL DEFAULT 1"),

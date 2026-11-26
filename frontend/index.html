@@ -532,10 +532,10 @@
               <input type="text" id="u-resource" value="REQ-MY-001" />
             </div>
             <div class="btn-row" style="margin-bottom:10px;">
-              <button class="btn btn-primary btn-sm" onclick="generateUserChallenge()">Start Verification Session</button>
+              <button class="btn btn-primary btn-sm" id="btn-start-user-verify" onclick="generateUserChallenge()">Start Live Voice Verification</button>
               <span class="small" id="u-session-label">No active session</span>
             </div>
-            <div class="mono-box" id="u-challenge-box">Start a verification session, then record or upload your voice (&gt;4s WAV) to confirm your identity.</div>
+            <div class="status-line" id="u-challenge-box">Click Start Live Voice Verification to start your microphone and verify your voice directly.</div>
           </div>
         </div>
 
@@ -1398,13 +1398,16 @@
         source.connect(analyser); analyser.connect(proc); proc.connect(ctx.destination);
 
         btn.className = "btn btn-danger btn-sm";
-        btn.textContent = "Stop Recording";
+        btn.textContent = target === "user-verify" ? "Stop & Verify Voice" : "Stop Recording";
         if (ui.canvas) drawLiveWaveform(ui.canvas);
 
         state.rec.timerId = setInterval(() => {
           const sec = (performance.now() - state.rec.startMs) / 1000;
           timerPill.textContent = ui.enroll ? `${sec.toFixed(1)}s / 15–60s` : `${sec.toFixed(1)}s / 8–15s`;
           timerPill.className = "pill " + (ui.enroll ? (sec >= 15 && sec <= 60 ? "ok" : "warn") : (sec > 4 ? "ok" : "warn"));
+          if (target === "user-verify" && state.userSession && sec >= 8.5) {
+            stopMic();
+          }
         }, 100);
       } catch (err) {
         setStatus(ui.status, `Microphone unavailable: ${err.message}`, "err");
@@ -1413,6 +1416,7 @@
 
     async function stopMic() {
       const target = state.rec.target;
+      if (!target) return;
       const ui = REC_UI[target];
       clearInterval(state.rec.timerId);
       cancelAnimationFrame(state.rec.rafId);
@@ -1433,9 +1437,13 @@
       btn.className = "btn btn-ghost btn-sm"; btn.textContent = ui.idleLabel;
       if (ui.canvas) drawIdleWaveform(ui.canvas);
       state.rec.target = null;
+
+      if (target === "user-verify" && state.userSession && state.userSession.status === "PENDING") {
+        await submitUserVerification();
+      }
     }
 
-    function onFilePicked(target) {
+    async function onFilePicked(target) {
       const inputId = {
         "reg-enroll": "file-reg-enroll",
         "admin-enroll": "file-enroll",
@@ -1447,6 +1455,9 @@
       if (!file) return;
       state.blobs[target] = file;
       document.getElementById(REC_UI[target].info).textContent = `Selected: ${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
+      if (target === "user-verify" && state.userSession && state.userSession.status === "PENDING") {
+        await submitUserVerification();
+      }
     }
 
     /* ---------------- USER DASHBOARD FUNCTIONS ---------------- */
@@ -1536,15 +1547,26 @@
       const sector = document.getElementById("u-sector").value;
       const action = document.getElementById("u-action").value;
       const resourceRef = document.getElementById("u-resource").value.trim();
+      if (state.rec.target === "user-verify") {
+        await stopMic();
+        return;
+      }
+      state.blobs["user-verify"] = null;
       try {
         const sess = await apiJson("/api/v1/verification-sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sector, subject_ref: state.user.subject_ref, action, resource_ref: resourceRef })
+          body: JSON.stringify({
+            sector,
+            subject_ref: state.user.subject_ref,
+            action,
+            resource_ref: resourceRef,
+            challenge_mode: "direct_voice"
+          })
         });
         state.userSession = sess;
         document.getElementById("u-session-label").textContent = `Session: ${sess.session_id.slice(0, 8)}...`;
-        document.getElementById("u-challenge-box").textContent = sess.challenge_text;
+        setStatus("u-challenge-box", "Live voice check started — speak naturally (auto-verifies after ~8.5s, or click Stop & Verify Voice after 4s).", "ok");
         clearInterval(state.userChallengeTimerId);
         const pill = document.getElementById("u-challenge-ttl");
         const tick = () => {
@@ -1555,7 +1577,8 @@
         };
         tick();
         state.userChallengeTimerId = setInterval(tick, 500);
-        setStatus("u-verify-status", "Session ready. Record (>4s) or upload a WAV clip.", "ok");
+        setStatus("u-verify-status", "Listening live — speak naturally to verify your voice...", "warn");
+        await toggleMic("user-verify");
       } catch (err) {
         setStatus("u-verify-status", err.message, "err");
       }
@@ -1570,6 +1593,7 @@
       setStatus("u-verify-status", "Verifying your voice...", "");
       try {
         const res = await apiJson(`/api/v1/verification-sessions/${state.userSession.session_id}/audio`, { method: "POST", body: fd });
+        state.userSession.status = res.status;
         const oPill = document.getElementById("u-outcome-pill");
         const isBlock = res.outcome === "REJECTED";
         oPill.textContent = res.outcome === "APPROVED" ? "APPROVED — PROCEED TO NEXT STEP" : isBlock ? "REJECTED — REQUEST CANCELLED" : res.outcome;

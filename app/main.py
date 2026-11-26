@@ -346,6 +346,7 @@ class CreateSessionRequest(BaseModel):
     subject_ref: str = Field(..., min_length=2, max_length=64)
     action: str
     resource_ref: str = Field(..., min_length=2, max_length=128)
+    challenge_mode: Literal["phrase", "direct_voice"] = "phrase"
     after_hours: bool = False
     privileged_role: bool = False
     amount_inr: float | None = None
@@ -1474,8 +1475,9 @@ def create_verification_session(
 
     now = utcnow()
     session_id = str(uuid.uuid4())
-    challenge_text = generate_challenge_phrase(body.sector, body.action, body.resource_ref)
-    challenge_hash = hash_text_sha256(normalize_transcript(challenge_text))
+    is_direct_voice = body.challenge_mode == "direct_voice"
+    challenge_text = "" if is_direct_voice else generate_challenge_phrase(body.sector, body.action, body.resource_ref)
+    challenge_hash = hash_text_sha256(normalize_transcript(challenge_text) if challenge_text else session_id)
     expires_at = now + timedelta(minutes=SESSION_TTL_MINUTES)
     call_velocity_1h = _compute_call_velocity_1h(db, body.subject_ref, now)
 
@@ -1495,6 +1497,7 @@ def create_verification_session(
         sim_age_days=body.sim_age_days,
         device_changed=bool(body.device_changed),
         call_velocity_1h=call_velocity_1h,
+        challenge_mode=body.challenge_mode,
     )
     db.add(session)
     db.commit()
@@ -1506,6 +1509,7 @@ def create_verification_session(
         "subject_ref": session.subject_ref,
         "action": session.action,
         "resource_ref": session.resource_ref,
+        "challenge_mode": session.challenge_mode,
         "challenge_text": session.challenge_text,
         "challenge_hash": session.challenge_hash,
         "expires_at": _as_utc(session.expires_at).isoformat(),
@@ -1616,9 +1620,17 @@ async def submit_verification_audio(
         quality_report = inspect_pcm_wav_quality(wav_bytes)
     quality_failed = bool(quality_report is not None and quality_report.valid_wav and not quality_report.passed)
 
+    is_direct_voice = session.challenge_mode == "direct_voice"
     asr_available = True
     effective_transcript = ""
-    if not is_expired and not enrollment_rejected and not enrollment_under_review_hold and replay_match_type is None and not quality_failed:
+    if (
+        not is_direct_voice
+        and not is_expired
+        and not enrollment_rejected
+        and not enrollment_under_review_hold
+        and replay_match_type is None
+        and not quality_failed
+    ):
         if demo_mode and spoken_transcript.strip():
             effective_transcript = spoken_transcript
             asr_available = True
@@ -1628,8 +1640,8 @@ async def submit_verification_audio(
             effective_transcript = asr_res.transcript or ""
             # Client transcript is completely ignored in LIVE mode (DEMO_MODE=false)
 
-    require_phrase = is_critical or (demo_mode and strict_phrase)
-    phrase_match = verify_phrase_match(session.challenge_text, effective_transcript)
+    require_phrase = False if is_direct_voice else (is_critical or (demo_mode and strict_phrase))
+    phrase_match = True if is_direct_voice else verify_phrase_match(session.challenge_text, effective_transcript)
     phrase_blocked_before_provider = require_phrase and asr_available and not phrase_match
     should_call_provider = (
         not is_expired

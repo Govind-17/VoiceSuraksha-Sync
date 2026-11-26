@@ -65,6 +65,7 @@ class VerificationSession(Base):
     call_velocity_1h: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     parent_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     challenge_attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    challenge_mode: Mapped[str] = mapped_column(String(32), default="phrase", nullable=False)
 
 
 class VoiceResult(Base):

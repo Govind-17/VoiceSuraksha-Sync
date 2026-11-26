@@ -3046,3 +3046,83 @@ def test_enrollment_unrelated_voices_no_match_enroll_as_active(make_test_client)
     assert e2["duplicate_of_subject_ref"] is None
     assert e3["duplicate_of_subject_ref"] is None
     assert len(verify_calls) == 3  # 1 against SUB-UNREL-1 + 2 against SUB-UNREL-1 & SUB-UNREL-2
+
+
+def test_direct_voice_check_skips_random_phrase_and_verifies_biometrics(make_test_client):
+    fake_verify = copy.deepcopy(VERIFY_FIXTURE)
+    fake_verify["deepfake"]["verdict"] = "fake"
+    fake_verify["deepfake"]["is_synthetic"] = True
+    mode = {"fake": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(fake_verify if mode["fake"] else VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler, auto_login_admin=False)
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "direct.voice.user",
+            "display_name": "Direct Voice User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "C-DIR-1",
+            "consent_text": "Explicit speaker consent confirmed for direct live voice check.",
+        },
+        files={"file": ("enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    ).json()
+    sub = reg["user"]["subject_ref"]
+
+    # Even with ASR unavailable, direct_voice creates no random phrase and approves natural genuine speech
+    client._asr_cfg["available"] = False
+    s1 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": sub,
+            "action": "sim_replacement",
+            "resource_ref": "SIM-DIRECT-1",
+            "challenge_mode": "direct_voice",
+        },
+    )
+    assert s1.status_code == 200
+    s1_body = s1.json()
+    assert s1_body["challenge_mode"] == "direct_voice"
+    assert s1_body["challenge_text"] == ""
+
+    r1 = client.post(
+        f"/api/v1/verification-sessions/{s1_body['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("natural.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r1["outcome"] == "APPROVED"
+    assert r1["phrase_match"] is True
+
+    # Synthetic/deepfake audio still rejects fail-closed in direct_voice mode
+    mode["fake"] = True
+    s2 = client.post(
+        "/api/v1/verification-sessions",
+        json={
+            "sector": "telecom",
+            "subject_ref": sub,
+            "action": "sim_replacement",
+            "resource_ref": "SIM-DIRECT-2",
+            "challenge_mode": "direct_voice",
+        },
+    ).json()
+    r2 = client.post(
+        f"/api/v1/verification-sessions/{s2['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("fake.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r2["outcome"] == "REJECTED"
+    assert "DEEPFAKE_SIGNAL" in r2["reason_codes"]
+
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    assert 'challenge_mode: "direct_voice"' in html
+    assert 'toggleMic("user-verify")' in html
