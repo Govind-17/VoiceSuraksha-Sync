@@ -43,21 +43,82 @@
     .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
 
     /* Navbar */
+    section[id], main[id], div[id].card, div[id].obsidian-card { scroll-margin-top: 92px; }
     .navbar {
-      position: sticky; top: 0; z-index: 40;
-      background: var(--silver);
-      border-bottom: 1px solid rgba(171, 190, 209, 0.35);
+      position: sticky; top: 0; z-index: 50;
+      background: rgba(14, 23, 30, 0.94);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(40, 203, 139, 0.35);
+      box-shadow: 0 6px 24px rgba(10, 17, 24, 0.24);
     }
-    .nav-inner { height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .nav-inner {
+      min-height: 70px; padding: 8px 0;
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    }
     .brand {
-      display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--secondary);
-      font-weight: 700; font-size: 19px; letter-spacing: -0.02em;
+      display: flex; align-items: center; gap: 11px; text-decoration: none; color: #F8FAFC;
+      font-weight: 700; font-size: 17.5px; letter-spacing: -0.02em; white-space: nowrap; flex-shrink: 0;
     }
-    .nav-links { display: flex; align-items: center; gap: 24px; }
-    .nav-links a { text-decoration: none; color: var(--gray-900); font-size: 14.5px; font-weight: 500; }
-    .nav-links a:hover { color: var(--primary); }
-    .nav-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-    @media (max-width: 980px) { .nav-links { display: none; } }
+    .brand-icon {
+      width: 34px; height: 34px; border-radius: 9px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: rgba(40, 203, 139, 0.14); border: 1px solid rgba(40, 203, 139, 0.45);
+      box-shadow: 0 0 14px rgba(40, 203, 139, 0.22);
+    }
+    .brand-sub {
+      display: block; font-family: var(--mono); font-size: 10px; font-weight: 600;
+      color: #28CB8B; letter-spacing: 0.06em; text-transform: uppercase;
+    }
+    .nav-links { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; }
+    .nav-links a, .nav-links button {
+      background: transparent; border: 1px solid transparent; cursor: pointer;
+      text-decoration: none; color: #CBD5E1; font-family: var(--sans);
+      font-size: 13px; font-weight: 500; padding: 6px 10px; border-radius: 6px;
+      white-space: nowrap; transition: all 0.15s ease;
+    }
+    .nav-links a:hover, .nav-links button:hover {
+      color: #28CB8B; background: rgba(40, 203, 139, 0.1); border-color: rgba(40, 203, 139, 0.28);
+    }
+    .nav-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+    .navbar .pill {
+      background: rgba(255, 255, 255, 0.06); border-color: rgba(148, 163, 184, 0.28);
+      color: #E2E8F0; padding: 4px 10px; font-size: 10.5px;
+    }
+    .navbar .pill.ok { background: rgba(40, 203, 139, 0.14); border-color: rgba(40, 203, 139, 0.45); color: #34D399; }
+    .navbar .pill.info { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.42); color: #7DD3FC; }
+    .navbar .pill.warn { background: rgba(251, 192, 45, 0.14); border-color: rgba(251, 192, 45, 0.45); color: #FCD34D; }
+    .navbar .pill.bad { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.48); color: #FCA5A5; }
+    .navbar .btn-nav-ghost {
+      background: rgba(255, 255, 255, 0.06); color: #E2E8F0; border: 1px solid rgba(148, 163, 184, 0.32);
+      padding: 6px 11px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    }
+    .navbar .btn-nav-ghost:hover:not(:disabled) { border-color: #28CB8B; color: #28CB8B; background: rgba(40, 203, 139, 0.1); }
+    .navbar .btn-nav-logout {
+      background: rgba(40, 203, 139, 0.14); color: #34D399; border: 1px solid rgba(40, 203, 139, 0.48);
+      padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    }
+    .navbar .btn-nav-logout:hover { background: #28CB8B; color: #0B1117; }
+    .nav-menu-btn {
+      display: none; background: rgba(255, 255, 255, 0.07); color: #F8FAFC;
+      border: 1px solid rgba(40, 203, 139, 0.38); border-radius: 6px;
+      padding: 6px 10px; font-size: 15px; line-height: 1; cursor: pointer;
+    }
+    .mobile-drawer {
+      background: #0F1820; border-top: 1px solid rgba(40, 203, 139, 0.22);
+      padding: 10px 24px 14px; display: flex; flex-wrap: wrap; gap: 8px;
+    }
+    .mobile-drawer a, .mobile-drawer button {
+      color: #E2E8F0; text-decoration: none; font-size: 12.5px; font-weight: 500;
+      padding: 6px 11px; border-radius: 6px; background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(148, 163, 184, 0.22); cursor: pointer;
+    }
+    .mobile-drawer a:hover, .mobile-drawer button:hover { border-color: #28CB8B; color: #28CB8B; }
+    @media (max-width: 1120px) {
+      .nav-links { display: none !important; }
+      .nav-menu-btn { display: inline-flex; align-items: center; }
+      #storage-pill, #sim-pill { display: none !important; }
+    }
 
     .pill {
       display: inline-flex; align-items: center; gap: 6px;
@@ -371,21 +432,42 @@
 </head>
 <body>
   <!-- Header -->
-  <header class="navbar">
+  <header class="navbar" id="top">
     <div class="container nav-inner">
       <a href="#top" class="brand">
-        <svg width="32" height="24" viewBox="0 0 32 24" fill="none" aria-hidden="true">
-          <path d="M4 16L10 4L16 14L22 4L28 16L16 22L4 16Z" fill="#4CAF4F"/>
-          <circle cx="16" cy="12" r="3" fill="#263238"/>
-        </svg>
-        <span>VoiceSuraksha-Sync</span>
+        <span class="brand-icon" aria-hidden="true">
+          <svg width="22" height="16" viewBox="0 0 32 24" fill="none">
+            <path d="M4 16L10 4L16 14L22 4L28 16L16 22L4 16Z" fill="#28CB8B"/>
+            <circle cx="16" cy="12" r="3" fill="#0F171E"/>
+          </svg>
+        </span>
+        <span>
+          VoiceSuraksha-Sync
+          <span class="brand-sub">Voice Trust Gateway</span>
+        </span>
       </a>
+
+      <!-- Guest nav links (when logged out) -->
+      <nav class="nav-links" id="guest-nav-links">
+        <button type="button" onclick="switchAuthPortal('user'); switchUserAuthMode('login');">User Sign In</button>
+        <button type="button" onclick="switchAuthPortal('user'); switchUserAuthMode('register');">Enroll Voice</button>
+        <button type="button" onclick="switchAuthPortal('admin');">Admin SOC</button>
+      </nav>
+
+      <!-- User-only nav links -->
+      <nav class="nav-links hidden" id="user-nav-links">
+        <a href="#user-voice-saved-card">My Voiceprint</a>
+        <a href="#user-request-card">Verify Voice</a>
+        <a href="#user-history-card">History</a>
+      </nav>
 
       <!-- Admin-only nav links -->
       <nav class="nav-links hidden" id="admin-nav-links">
         <a href="#profiles">Profiles</a>
         <a href="#workspace">Gateway</a>
         <a href="#telemetry">Telemetry</a>
+        <a href="#flagged-enrollments-card">Flagged</a>
+        <a href="#review-queue-card">Queue</a>
         <a href="#sandbox">Sandbox</a>
         <a href="#audit">Audit</a>
       </nav>
@@ -395,11 +477,13 @@
         <span class="pill info hidden" id="role-pill"></span>
         <span class="pill hidden" id="storage-pill">DB: --</span>
         <span class="pill hidden" id="enrolled-pill">ENROLLED: <strong id="enrolled-count">0</strong></span>
-        <span class="pill warn hidden" id="sim-pill">SIMULATED OPERATOR SIGNALS</span>
-        <button class="btn btn-ghost btn-sm hidden" id="btn-clear-alerts" onclick="clearDemoAlerts()">Clear Demo Alerts</button>
-        <button class="btn btn-secondary btn-sm hidden" id="btn-logout" onclick="logout()">Logout</button>
+        <span class="pill warn hidden" id="sim-pill">SIMULATED</span>
+        <button class="btn-nav-ghost hidden" id="btn-clear-alerts" onclick="clearDemoAlerts()">Clear Alerts</button>
+        <button class="btn-nav-logout hidden" id="btn-logout" onclick="logout()">Logout</button>
+        <button type="button" class="nav-menu-btn" id="nav-menu-toggle" aria-label="Toggle navigation" onclick="toggleMobileNav()">&#9776;</button>
       </div>
     </div>
+    <div class="mobile-drawer hidden" id="mobile-nav-drawer"></div>
   </header>
 
   <!-- VIEW 0: AUTHENTICATION GATE (shown ONLY when logged out) -->
@@ -507,7 +591,7 @@
             <div class="status-line ok" id="user-voice-saved-summary">Voiceprint saved during account registration. No re-enrollment required on login.</div>
           </div>
 
-          <div class="card">
+          <div class="card" id="user-request-card">
             <div class="card-hdr">
               <div class="card-title"><span class="step-tag">REQUEST</span> Start Protected Action Check</div>
               <span class="pill warn" id="u-challenge-ttl">TTL: 02:00</span>
@@ -579,7 +663,7 @@
             </div>
           </div>
 
-          <div class="card">
+          <div class="card" id="user-history-card">
             <div class="card-hdr">
               <div class="card-title"><span class="step-tag">HISTORY</span> My Recent Verification Requests</div>
               <button class="btn btn-ghost btn-sm" onclick="refreshUserDashboard()">Refresh</button>
@@ -1106,6 +1190,27 @@
       }
     };
 
+    function toggleMobileNav() {
+      const drawer = document.getElementById("mobile-nav-drawer");
+      if (!drawer) return;
+      const isHidden = drawer.classList.contains("hidden");
+      if (!isHidden) {
+        drawer.classList.add("hidden");
+        return;
+      }
+      const sourceId = state.user?.role === "admin"
+        ? "admin-nav-links"
+        : state.user?.role === "user"
+          ? "user-nav-links"
+          : "guest-nav-links";
+      const src = document.getElementById(sourceId);
+      drawer.innerHTML = src ? src.innerHTML : "";
+      drawer.querySelectorAll("a, button").forEach(el => {
+        el.addEventListener("click", () => drawer.classList.add("hidden"));
+      });
+      drawer.classList.remove("hidden");
+    }
+
     function escapeHtml(str) {
       return String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     }
@@ -1252,6 +1357,8 @@
       document.getElementById("user-dashboard").classList.toggle("hidden", !isUser);
       document.getElementById("admin-dashboard").classList.toggle("hidden", !isAdmin);
 
+      document.getElementById("guest-nav-links").classList.toggle("hidden", isAuth);
+      document.getElementById("user-nav-links").classList.toggle("hidden", !isUser);
       document.getElementById("admin-nav-links").classList.toggle("hidden", !isAdmin);
       document.getElementById("btn-logout").classList.toggle("hidden", !isAuth);
       document.getElementById("role-pill").classList.toggle("hidden", !isAuth);
@@ -1259,6 +1366,8 @@
       document.getElementById("enrolled-pill").classList.toggle("hidden", !isAdmin);
       document.getElementById("sim-pill").classList.toggle("hidden", !isAdmin);
       document.getElementById("btn-clear-alerts").classList.toggle("hidden", !isAdmin);
+      const mobileDrawer = document.getElementById("mobile-nav-drawer");
+      if (mobileDrawer) mobileDrawer.classList.add("hidden");
 
       if (!isAuth) return;
 
