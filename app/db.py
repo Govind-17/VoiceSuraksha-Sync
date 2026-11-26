@@ -1,7 +1,6 @@
 """Database engine, durability helpers, and schema migrations for VoiceSuraksha-Sync."""
 
 import os
-import threading
 from collections.abc import Generator
 from pathlib import Path
 
@@ -9,8 +8,7 @@ from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DB_URL = "sqlite:///./voicesuraksha.db"
-CURRENT_SCHEMA_VERSION = 4
-_DB_INIT_LOCK = threading.Lock()
+CURRENT_SCHEMA_VERSION = 5
 
 
 def get_database_url() -> str:
@@ -85,6 +83,16 @@ def run_schema_migrations(target_engine=None) -> None:
             ("privileged_role", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
             ("consent_text", "TEXT NOT NULL DEFAULT ''"),
             ("re_enrolled_at", f"{ts_type}"),
+            ("enrollment_status", "VARCHAR(32) NOT NULL DEFAULT 'ACTIVE'"),
+            ("duplicate_of_subject_ref", "VARCHAR(64)"),
+            ("enrollment_reason_codes_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("enroll_deepfake_score", "FLOAT"),
+            ("enroll_deepfake_threshold", "FLOAT"),
+            ("enroll_deepfake_segments_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("enroll_deepfake_request_id", "VARCHAR(128)"),
+            ("reviewed_by", "VARCHAR(64)"),
+            ("review_reason", "TEXT"),
+            ("reviewed_at", f"{ts_type}"),
         ],
         "user_accounts": [
             ("privileged_role", f"BOOLEAN NOT NULL DEFAULT {bool_default}"),
@@ -106,7 +114,6 @@ def run_schema_migrations(target_engine=None) -> None:
     }
 
     with eng.begin() as conn:
-        inspector = inspect(conn)
         for table_name, col_specs in migrations.items():
             if inspector.has_table(table_name):
                 existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
@@ -132,13 +139,12 @@ def run_schema_migrations(target_engine=None) -> None:
 
 
 def init_db(target_engine=None) -> None:
-    """Create all database tables and run lightweight migrations (serialized lock-safe)."""
+    """Create all database tables and run lightweight migrations."""
     from app import models  # noqa: F401
 
-    with _DB_INIT_LOCK:
-        eng = target_engine or engine
-        Base.metadata.create_all(bind=eng)
-        run_schema_migrations(eng)
+    eng = target_engine or engine
+    Base.metadata.create_all(bind=eng)
+    run_schema_migrations(eng)
 
 
 def get_db() -> Generator[Session, None, None]:

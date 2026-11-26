@@ -28,6 +28,16 @@ Every backend endpoint, audit event, compliance JSON dossier, and dashboard pane
 | Token replay & race double-consume | Atomic SQL `UPDATE ... WHERE consumed_at IS NULL AND expires_at > now` + action/resource binding | First `200`, concurrent/replay `409` |
 | Brute-force login & endpoint flooding | In-memory + SQL `GatewayRateLimiter` + 5-fail lockout persisted across restarts | HTTP `429` + `Retry-After` + `RATE_LIMITED` audit event |
 | Audit log tampering | `AuditEvent` SHA-256 hash chain (`prev_hash` → `entry_hash`) verified by `GET /api/v1/audit/verify-chain` | Exact broken index detected |
+| Synthetic voice enrollment | Aletheia `detect_deepfake()` runs BEFORE `enroll_speaker()` | Rejected (`ENROLLMENT_SYNTHETIC_INDICATOR`, not saved) or `503` on outage |
+| Multi-account duplicate voice | Exact `audio_sha256` match + parallel Eidos `verify_with_deepfake()` against `ACTIVE` enrollments (~20s budget) | `PENDING_REVIEW` (`DUPLICATE_VOICE_DETECTED` / `DUPLICATE_CHECK_INCOMPLETE`) |
+
+## Enrollment Protection (Aletheia Deepfake Gate + Duplicate-Voice Check)
+
+Every voice enrollment (`/api/v1/auth/register-with-voice` and `POST /api/v1/enrollments`) passes through `_validate_and_enroll_wav`:
+1. **Enrollment Deepfake Gate (`detect_deepfake`)**: Aletheia (`POST /v1/deepfake/detect`) scores the incoming WAV before Eidos enrolls it. If `verdict == "fake"`, enrollment is blocked (`ENROLLMENT_SYNTHETIC_INDICATOR`) with calm re-record guidance and an audit entry (no "100% FAKE" claim). Any provider error or unparseable verdict fails closed with HTTP `503` (`PROVIDER_UNAVAILABLE`). Passing `score`, `threshold`, `segments`, and `request_id` metadata are stored for SOC review.
+2. **Duplicate-Voice Check (`verify_with_deepfake`)**: Before `enroll_speaker()`, incoming audio is checked against every other `ACTIVE` enrollment via exact `audio_sha256` equality (zero API calls) followed by concurrent `verify_with_deepfake()` checks (max 8 parallel, ~20s budget). Matches or incomplete checks save the enrollment as `PENDING_REVIEW` (`DUPLICATE_VOICE_DETECTED` or `DUPLICATE_CHECK_INCOMPLETE`) rather than hard-rejecting twins/family members. End users see only a neutral manual-review message (matched `subject_ref` is admin-only); critical actions route to `REVIEW / HOLD` (`ENROLLMENT_UNDER_REVIEW`) with fallbacks while `emergency_sim_block` / `wifi_support` remain active. Admins review flagged rows via `GET /api/v1/admin/enrollments?status=PENDING_REVIEW` and `POST /api/v1/admin/enrollments/{subject_ref}/review`.
+
+> **Third-Party Provider Note**: All voice biometric and anti-spoofing evaluations rely exclusively on **DetectifAI Eidos** (`POST /v1/speakers/enroll`, `POST /v1/speakers/verify`) and **DetectifAI Aletheia** (`POST /v1/deepfake/detect`), alongside an optional hosted speech-to-text endpoint configured via `ASR_PROVIDER` (`sarvam`, `deepgram`, or `groq`) — no other external biometric/ML providers or local neural models are used.
 
 ## Gateway Profiles (`GATEWAY_PROFILES`)
 

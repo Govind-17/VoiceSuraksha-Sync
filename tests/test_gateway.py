@@ -35,6 +35,7 @@ from app.rate_limit import gateway_rate_limiter
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 ENROLL_FIXTURE = json.loads((FIXTURES_DIR / "eidos_enroll.json").read_text(encoding="utf-8"))
 VERIFY_FIXTURE = json.loads((FIXTURES_DIR / "eidos_verify_with_deepfake.json").read_text(encoding="utf-8"))
+ALETHEIA_DETECT_FIXTURE = json.loads((FIXTURES_DIR / "aletheia_detect.json").read_text(encoding="utf-8"))
 _WAV_NONCE = 0
 
 
@@ -158,6 +159,8 @@ def _default_fixture_handler(verify_override: dict | None = None):
     def handler(request: httpx.Request) -> httpx.Response:
         captured_headers.append(dict(request.headers))
         assert "idempotency-key" in request.headers
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             payload = copy.deepcopy(ENROLL_FIXTURE)
             return httpx.Response(200, json=payload)
@@ -267,7 +270,7 @@ def test_happy_path_telecom_sim_replacement_and_consume(make_test_client, db_ses
     )
     assert consume_resp.status_code == 200
     assert consume_resp.json()["consumed"] is True
-    assert len(captured_headers) == 2
+    assert len(captured_headers) == 3  # deepfake gate + enroll + verify
 
     # Confirm raw audio is never stored in SQLite
     with db_session_factory() as db:
@@ -304,8 +307,8 @@ def test_wrong_phrase_and_session_replay(make_test_client):
     assert data["reason_codes"] == ["CHALLENGE_MISMATCH"]
     assert data["decision_token"] is None
     assert data["emitted_risk_event"]["event_type"] == "SIM_SWAP_ATTEMPT_BLOCKED"
-    # Verify only enroll called DetectifAI, not verify
-    assert len(captured_headers) == 1
+    # Only enrollment (deepfake detect + enroll) called DetectifAI, not verify
+    assert len(captured_headers) == 2
 
     # Replaying audio against the same session must return HTTP 409
     replay = client.post(
@@ -346,7 +349,7 @@ def test_expired_session_rejected(make_test_client, db_session_factory):
     assert data["outcome"] == "REJECTED"
     assert data["reason_codes"] == ["CHALLENGE_EXPIRED"]
     assert data["decision_token"] is None
-    assert len(captured_headers) == 1
+    assert len(captured_headers) == 2  # deepfake detect + enroll only
 
 
 def test_synthetic_deepfake_verdict_rejected(make_test_client):
@@ -451,6 +454,8 @@ def test_cross_domain_sim_swap_alert_holds_banking(make_test_client):
     call_mode = {"fake": True}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -510,6 +515,8 @@ def test_provider_timeout_and_403_fail_closed(make_test_client):
     mode = {"behavior": "timeout"}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -744,7 +751,7 @@ def test_critical_actions_enforce_server_asr_while_low_friction_allows_voice_fir
     assert data["voice_result"]["speaker_decision"] == "match"
     assert data["voice_result"]["deepfake_verdict"] == "real"
     assert data["decision_token"] is not None
-    assert len(captured_headers) == 2
+    assert len(captured_headers) == 3  # deepfake gate + enroll + low-friction verify
 
 
 def test_render_readiness_head_health_and_upload_limit(make_test_client):
@@ -1143,7 +1150,7 @@ def test_audio_replay_detected_even_when_transcript_matches(make_test_client):
         files={"file": ("verify.wav", reused_wav, "audio/wav")},
     ).json()
     assert res1["outcome"] == "APPROVED"
-    assert len(captured_headers) == 2
+    assert len(captured_headers) == 3
 
     # Second session submits the IDENTICAL WAV bytes even with matching transcript -> blocked!
     sess2 = client.post(
@@ -1165,7 +1172,7 @@ def test_audio_replay_detected_even_when_transcript_matches(make_test_client):
     assert res2["evidence_state"] == "REPLAY_DETECTED"
     assert res2["reason_codes"] == ["AUDIO_REPLAY_DETECTED"]
     assert res2["decision_token"] is None
-    assert len(captured_headers) == 2  # DetectifAI was NOT called again
+    assert len(captured_headers) == 3  # DetectifAI was NOT called again
     assert ServerASRAdapter(provider="disabled", api_key="").transcribe_wav(reused_wav).available is False
 
 
@@ -1249,7 +1256,7 @@ def test_silent_and_clipped_audio_quality_low_skips_detectif_provider(make_test_
     handler, captured_headers = _default_fixture_handler()
     client = make_test_client(handler)
     _enroll_subject(client, "SUB-AQ-1")
-    assert len(captured_headers) == 1
+    assert len(captured_headers) == 2  # deepfake gate + enroll
 
     # Silent audio (< -45 dBFS) -> REVIEW / HOLD + AUDIO_QUALITY_LOW without calling DetectifAI
     sess_sil = client.post(
@@ -1271,7 +1278,7 @@ def test_silent_and_clipped_audio_quality_low_skips_detectif_provider(make_test_
     assert sil_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert sil_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
     assert sil_res["audio_quality"]["rms_dbfs"] < -45.0
-    assert len(captured_headers) == 1
+    assert len(captured_headers) == 2
 
     # Heavily clipped audio (clipping_ratio > 0.15) -> also routes to REVIEW / HOLD without calling DetectifAI
     sess_clip = client.post(
@@ -1292,7 +1299,7 @@ def test_silent_and_clipped_audio_quality_low_skips_detectif_provider(make_test_
     assert clip_res["evidence_state"] == "INCONCLUSIVE_EVIDENCE"
     assert clip_res["reason_codes"] == ["AUDIO_QUALITY_LOW"]
     assert clip_res["audio_quality"]["clipping_ratio"] > 0.15
-    assert len(captured_headers) == 1
+    assert len(captured_headers) == 2
 
 
 def test_hosted_asr_adapter_providers_and_fail_closed(make_pcm_fixture=None):
@@ -1675,6 +1682,8 @@ def test_cross_domain_alert_ttl_and_resolve_alert(make_test_client, db_session_f
     mode = {"fake": True}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -1786,6 +1795,8 @@ def test_every_hold_cause_returns_fallbacks_and_asr_down_still_rejects_fake(make
     mode = {"fake": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -1912,6 +1923,8 @@ def test_multi_segment_verification_and_disagreement_or_segment_fake(make_test_c
     mode = {"case": "one_fake"}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -1968,6 +1981,8 @@ def test_borderline_second_challenge_lineage_and_repeated_hold(make_test_client)
     mode = {"borderline": True}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -2412,6 +2427,8 @@ def test_metrics_decisions_per_min_p95_latency_and_ui_no_credit_wasted_copy(make
     call_idx = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
         if request.url.path == "/v1/speakers/enroll":
             return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
         if request.url.path == "/v1/speakers/verify":
@@ -2615,3 +2632,417 @@ def test_repo_cleanup_stray_file_removed_and_docs_present():
     assert "Honest Limitations" in readme
     assert "WEBHOOK_SIGNING_SECRET" in readme
     assert "ASR_PROVIDER" in readme
+
+
+def test_enrollment_fake_audio_rejected_not_saved_with_audit(make_test_client, db_session_factory):
+    fake_detect = copy.deepcopy(ALETHEIA_DETECT_FIXTURE)
+    fake_detect["result"]["verdict"] = "fake"
+    fake_detect["result"]["is_synthetic"] = True
+    fake_detect["result"]["score"] = 0.94
+
+    called_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called_paths.append(request.url.path)
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(fake_detect))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    r_admin = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": "SUB-FAKE-1",
+            "consent_confirmed": "true",
+            "consent_ref": "C-FAKE-1",
+            "consent_text": "Explicit speaker consent confirmed for synthetic gate test.",
+        },
+        files={"file": ("fake_enroll.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert r_admin.status_code == 422
+    detail = r_admin.json()["detail"]
+    assert detail["reason_codes"] == ["ENROLLMENT_SYNTHETIC_INDICATOR"]
+    assert "100% FAKE" not in json.dumps(detail).upper()
+    assert "/v1/speakers/enroll" not in called_paths
+
+    # Also test register-with-voice path atomically rejects & does NOT create user
+    r_reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "fake.voice.user",
+            "display_name": "Fake Voice User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "C-FAKE-2",
+            "consent_text": "Explicit speaker consent confirmed for registration test.",
+        },
+        files={"file": ("fake_reg.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert r_reg.status_code == 422
+    assert r_reg.json()["detail"]["reason_codes"] == ["ENROLLMENT_SYNTHETIC_INDICATOR"]
+
+    with db_session_factory() as db:
+        assert db.query(Enrollment).filter_by(subject_ref="SUB-FAKE-1").first() is None
+        audits = db.query(AuditEvent).all()
+        assert any("ENROLLMENT_SYNTHETIC_INDICATOR" in json.loads(a.reason_codes_json) and a.outcome == "REJECTED" for a in audits)
+
+
+def test_enrollment_real_audio_accepted_as_active_with_deepfake_metadata(make_test_client, db_session_factory):
+    handler, _ = _default_fixture_handler()
+    client = make_test_client(handler)
+    data = _enroll_subject(client, "SUB-REAL-ACTIVE")
+    enr = data["enrollment"]
+    assert enr["enrollment_status"] == "ACTIVE"
+    assert enr["enroll_deepfake_score"] == ALETHEIA_DETECT_FIXTURE["result"]["score"]
+    assert enr["enroll_deepfake_threshold"] == ALETHEIA_DETECT_FIXTURE["result"]["threshold"]
+    assert enr["enroll_deepfake_request_id"] == ALETHEIA_DETECT_FIXTURE["request_id"]
+    assert len(enr["enroll_deepfake_segments"]) == len(ALETHEIA_DETECT_FIXTURE["result"]["segments"])
+
+
+def test_enrollment_deepfake_gate_provider_error_or_unparseable_fails_closed_503(make_test_client, db_session_factory):
+    mode = {"case": "timeout"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            if mode["case"] == "timeout":
+                raise httpx.ReadTimeout("Simulated Aletheia timeout", request=request)
+            if mode["case"] == "unparseable":
+                bad = copy.deepcopy(ALETHEIA_DETECT_FIXTURE)
+                bad["result"]["verdict"] = "inconclusive_weird"
+                return httpx.Response(200, json=bad)
+            return httpx.Response(503, json={"error": {"code": "service_unavailable", "message": "Overloaded"}})
+        return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+
+    client = make_test_client(handler)
+    for err_case in ("timeout", "unparseable", "503"):
+        mode["case"] = err_case
+        resp = client.post(
+            "/api/v1/enrollments",
+            data={
+                "subject_ref": f"SUB-ERR-{err_case}",
+                "consent_confirmed": "true",
+                "consent_ref": f"C-{err_case}",
+                "consent_text": "Explicit speaker consent confirmed for fail-closed test.",
+            },
+            files={"file": ("err.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["reason_codes"] == ["PROVIDER_UNAVAILABLE"]
+
+    with db_session_factory() as db:
+        assert db.query(Enrollment).count() == 0
+        audits = db.query(AuditEvent).all()
+        assert any("PROVIDER_UNAVAILABLE" in json.loads(a.reason_codes_json) for a in audits)
+
+
+def test_enrollment_duplicate_voice_match_second_account_pending_review(make_test_client):
+    verify_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            verify_calls.append("called")
+            payload = copy.deepcopy(VERIFY_FIXTURE)
+            payload["result"]["decision"] = "match"
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    first = _enroll_subject(client, "SUB-DUP-ORIG")
+    assert first["enrollment"]["enrollment_status"] == "ACTIVE"
+
+    second = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": "SUB-DUP-SECOND",
+            "consent_confirmed": "true",
+            "consent_ref": "C-DUP-2",
+            "consent_text": "Explicit speaker consent confirmed for second account.",
+        },
+        files={"file": ("second_voice.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert second.status_code == 200
+    body = second.json()["enrollment"]
+    assert body["enrollment_status"] == "PENDING_REVIEW"
+    assert body["duplicate_of_subject_ref"] == "SUB-DUP-ORIG"
+    assert "DUPLICATE_VOICE_DETECTED" in body["reason_codes"]
+    assert len(verify_calls) == 1
+
+
+def test_enrollment_duplicate_sha256_flagged_without_calling_verify(make_test_client):
+    verify_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            verify_calls.append("verify_called")
+            return httpx.Response(200, json=copy.deepcopy(VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    shared_wav = make_pcm_wav_bytes(16.0)
+    r1 = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": "SUB-SHA-1",
+            "consent_confirmed": "true",
+            "consent_ref": "C-SHA-1",
+            "consent_text": "Explicit speaker consent confirmed for SHA check.",
+        },
+        files={"file": ("one.wav", shared_wav, "audio/wav")},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["enrollment"]["enrollment_status"] == "ACTIVE"
+
+    r2 = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": "SUB-SHA-2",
+            "consent_confirmed": "true",
+            "consent_ref": "C-SHA-2",
+            "consent_text": "Explicit speaker consent confirmed for SHA check.",
+        },
+        files={"file": ("two.wav", shared_wav, "audio/wav")},
+    )
+    assert r2.status_code == 200
+    b2 = r2.json()["enrollment"]
+    assert b2["enrollment_status"] == "PENDING_REVIEW"
+    assert b2["duplicate_of_subject_ref"] == "SUB-SHA-1"
+    assert "DUPLICATE_VOICE_DETECTED" in b2["reason_codes"]
+    assert len(verify_calls) == 0
+
+
+def test_enrollment_duplicate_check_timeout_or_error_fails_closed_incomplete(make_test_client, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(503, json={"error": {"code": "service_unavailable", "message": "Down"}})
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    r1 = _enroll_subject(client, "SUB-INC-1")
+    assert r1["enrollment"]["enrollment_status"] == "ACTIVE"
+
+    r2 = client.post(
+        "/api/v1/enrollments",
+        data={
+            "subject_ref": "SUB-INC-2",
+            "consent_confirmed": "true",
+            "consent_ref": "C-INC-2",
+            "consent_text": "Explicit speaker consent confirmed for incomplete check test.",
+        },
+        files={"file": ("two.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert r2.status_code == 200
+    b2 = r2.json()["enrollment"]
+    assert b2["enrollment_status"] == "PENDING_REVIEW"
+    assert b2["duplicate_of_subject_ref"] is None
+    assert "DUPLICATE_CHECK_INCOMPLETE" in b2["reason_codes"]
+
+
+def test_pending_review_user_critical_action_holds_while_emergency_sim_block_approved(make_test_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-PR-ORIG")
+
+    flagged = _enroll_subject(client, "SUB-PR-USER")
+    assert flagged["enrollment"]["enrollment_status"] == "PENDING_REVIEW"
+
+    # Critical action (sim_replacement) routes to REVIEW / HOLD with fallbacks
+    crit_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-PR-USER", "action": "sim_replacement", "resource_ref": "SIM-PR-1"},
+    ).json()
+    crit_res = client.post(
+        f"/api/v1/verification-sessions/{crit_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v1.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert crit_res["outcome"] == "REVIEW / HOLD"
+    assert crit_res["reason_codes"] == ["ENROLLMENT_UNDER_REVIEW"]
+    assert crit_res["decision_token"] is None
+    assert len(crit_res["fallback_options"]) == 3
+
+    # Protective low-friction emergency_sim_block still works and approves cleanly
+    emg_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-PR-USER", "action": "emergency_sim_block", "resource_ref": "SIM-EMG-PR"},
+    ).json()
+    emg_res = client.post(
+        f"/api/v1/verification-sessions/{emg_sess['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("v2.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert emg_res["outcome"] == "APPROVED"
+    assert emg_res["decision_token"] is not None
+
+
+def test_privacy_end_user_responses_never_contain_duplicate_subject_ref(make_test_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-PRIV-ORIG")
+    client.post("/api/v1/auth/logout")
+
+    # Standard user registers with matching voiceprint -> NEVER sees SUB-PRIV-ORIG anywhere
+    reg = client.post(
+        "/api/v1/auth/register-with-voice",
+        data={
+            "username": "privacy.user",
+            "display_name": "Privacy User",
+            "password": "password123",
+            "consent_confirmed": "true",
+            "consent_ref": "C-PRIV-1",
+            "consent_text": "Explicit speaker consent confirmed for privacy check.",
+        },
+        files={"file": ("reg.wav", make_pcm_wav_bytes(16.0), "audio/wav")},
+    )
+    assert reg.status_code == 200
+    reg_text = reg.text
+    assert "SUB-PRIV-ORIG" not in reg_text
+    assert "duplicate_of_subject_ref" not in reg_text
+    assert reg.json()["enrollment"]["enrollment_status"] == "PENDING_REVIEW"
+    assert (
+        reg.json()["enrollment"]["status_message"]
+        == "Your voiceprint was saved and needs a quick manual review before high-risk actions are enabled."
+    )
+
+    ov_resp = client.get("/api/v1/user/overview")
+    list_resp = client.get("/api/v1/enrollments")
+    for resp in (ov_resp, list_resp):
+        assert "SUB-PRIV-ORIG" not in resp.text
+        assert "duplicate_of_subject_ref" not in resp.text
+
+    # Admin sees duplicate_of_subject_ref via admin endpoint
+    from app.auth import get_admin_credentials
+
+    admin_u, admin_p = get_admin_credentials()
+    client.post("/api/v1/auth/logout")
+    client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+    flagged = client.get("/api/v1/admin/enrollments?status=PENDING_REVIEW").json()["enrollments"]
+    assert len(flagged) == 1
+    assert flagged[0]["duplicate_of_subject_ref"] == "SUB-PRIV-ORIG"
+
+
+def test_admin_enrollment_review_approve_and_reject_with_rbac(make_test_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            return httpx.Response(200, json=copy.deepcopy(VERIFY_FIXTURE))
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    _enroll_subject(client, "SUB-REV-ORIG")
+
+    # Enroll two flagged users cleanly by switching to user accounts or admin enroll
+    f_app = _enroll_subject(client, "SUB-REV-APP")["enrollment"]
+    assert f_app["enrollment_status"] == "PENDING_REVIEW"
+
+    # Non-admin gets 403 on admin enrollment endpoints
+    client.post("/api/v1/auth/logout")
+    client.post("/api/v1/auth/register", json={"username": "nonadmin.rev", "display_name": "Non Admin", "password": "password123"})
+    assert client.get("/api/v1/admin/enrollments?status=PENDING_REVIEW").status_code == 403
+    assert client.post("/api/v1/admin/enrollments/SUB-REV-APP/review", json={"decision": "APPROVED", "reason": "Unauthorized"}).status_code == 403
+
+    # Log back in as admin
+    from app.auth import get_admin_credentials
+
+    admin_u, admin_p = get_admin_credentials()
+    client.post("/api/v1/auth/logout")
+    client.post("/api/v1/auth/login", json={"username": admin_u, "password": admin_p})
+
+    # Approve SUB-REV-APP -> ACTIVE, critical sim_replacement works, audit logged
+    app_resp = client.post(
+        "/api/v1/admin/enrollments/SUB-REV-APP/review",
+        json={"decision": "APPROVED", "reason": "Confirmed identical twin in store"},
+    )
+    assert app_resp.status_code == 200
+    assert app_resp.json()["enrollment"]["enrollment_status"] == "ACTIVE"
+    assert app_resp.json()["audit_code"] == "ENROLLMENT_APPROVED"
+
+    s_ok = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-REV-APP", "action": "sim_replacement", "resource_ref": "SIM-APP-1"},
+    ).json()
+    r_ok = client.post(
+        f"/api/v1/verification-sessions/{s_ok['session_id']}/audio",
+        data={"spoken_transcript": ""},
+        files={"file": ("ok.wav", make_pcm_wav_bytes(6.0), "audio/wav")},
+    ).json()
+    assert r_ok["outcome"] == "APPROVED"
+
+    # Reject SUB-REV-APP (or another flagged user) -> unusable (403 on new sessions/callbacks)
+    rej_resp = client.post(
+        "/api/v1/admin/enrollments/SUB-REV-APP/review",
+        json={"decision": "REJECTED", "reason": "Fraudulent duplicate confirmed"},
+    )
+    assert rej_resp.status_code == 200
+    assert rej_resp.json()["enrollment"]["enrollment_status"] == "REJECTED"
+    assert rej_resp.json()["audit_code"] == "ENROLLMENT_REJECTED"
+
+    blocked_sess = client.post(
+        "/api/v1/verification-sessions",
+        json={"sector": "telecom", "subject_ref": "SUB-REV-APP", "action": "sim_replacement", "resource_ref": "SIM-BLK-1"},
+    )
+    assert blocked_sess.status_code == 403
+    audits = client.get("/api/v1/audit").json()["audit_events"]
+    assert any("ENROLLMENT_APPROVED" in a["reason_codes"] for a in audits)
+    assert any("ENROLLMENT_REJECTED" in a["reason_codes"] for a in audits)
+
+
+def test_enrollment_unrelated_voices_no_match_enroll_as_active(make_test_client):
+    verify_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/deepfake/detect":
+            return httpx.Response(200, json=copy.deepcopy(ALETHEIA_DETECT_FIXTURE))
+        if request.url.path == "/v1/speakers/enroll":
+            return httpx.Response(200, json=copy.deepcopy(ENROLL_FIXTURE))
+        if request.url.path == "/v1/speakers/verify":
+            verify_calls.append("verify")
+            payload = copy.deepcopy(VERIFY_FIXTURE)
+            payload["result"]["decision"] = "no_match"
+            payload["result"]["similarity"] = 0.18
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    client = make_test_client(handler)
+    e1 = _enroll_subject(client, "SUB-UNREL-1")["enrollment"]
+    e2 = _enroll_subject(client, "SUB-UNREL-2")["enrollment"]
+    e3 = _enroll_subject(client, "SUB-UNREL-3")["enrollment"]
+
+    assert e1["enrollment_status"] == "ACTIVE"
+    assert e2["enrollment_status"] == "ACTIVE"
+    assert e3["enrollment_status"] == "ACTIVE"
+    assert e2["duplicate_of_subject_ref"] is None
+    assert e3["duplicate_of_subject_ref"] is None
+    assert len(verify_calls) == 3  # 1 against SUB-UNREL-1 + 2 against SUB-UNREL-1 & SUB-UNREL-2

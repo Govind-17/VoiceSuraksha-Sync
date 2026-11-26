@@ -914,10 +914,32 @@
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Subject Ref</th><th>Consent Ref</th><th>Speech (s)</th><th>Audio SHA-256</th><th>Enrolled At (UTC)</th></tr></thead>
-              <tbody id="enrolled-tbody"><tr><td colspan="5" class="small">No enrolled subjects yet.</td></tr></tbody>
+              <thead><tr><th>Subject Ref</th><th>Status</th><th>Deepfake Score</th><th>Duplicate Of</th><th>Consent Ref</th><th>Speech (s)</th><th>Audio SHA-256</th><th>Enrolled At (UTC)</th></tr></thead>
+              <tbody id="enrolled-tbody"><tr><td colspan="8" class="small">No enrolled subjects yet.</td></tr></tbody>
             </table>
           </div>
+        </div>
+
+        <!-- Flagged Enrollments Review Panel -->
+        <div class="obsidian-card" id="flagged-enrollments-card" style="margin-bottom:20px;">
+          <div class="card-hdr">
+            <div class="card-title"><span class="step-tag">ENROLLMENT PROTECTION</span> Flagged Enrollments (<code>PENDING_REVIEW</code>)</div>
+            <button type="button" class="btn-obsidian-ghost" onclick="refreshAdminPanels()">Refresh Flagged</button>
+          </div>
+          <p class="small" style="color:#94A3B8;margin:0 0 12px;">
+            Review duplicate-voice or incomplete-check enrollments (<code style="color:#28CB8B;">PENDING_REVIEW</code>). End users never see matched account refs; admins approve to <code style="color:#28CB8B;">ACTIVE</code> or reject to <code style="color:#FF6B6B;">REJECTED</code> with a required reason.
+          </p>
+          <div class="form-row" style="margin-bottom:12px;">
+            <label for="enroll-review-reason-input" style="color:#CBD5E1;">Required Enrollment Review Reason (audit-logged with timestamp)</label>
+            <input type="text" id="enroll-review-reason-input" placeholder="e.g. Confirmed twin/family voice via in-person KYC / Reject suspected multi-account abuse" style="background:#0B1117;color:#F8FAFC;border-color:rgba(40,203,139,0.35);" />
+          </div>
+          <div class="table-wrap" style="border-color:rgba(40,203,139,0.28);background:#0B1117;">
+            <table>
+              <thead><tr><th style="background:#141E26;color:#CBD5E1;">Subject Ref</th><th style="background:#141E26;color:#CBD5E1;">Status</th><th style="background:#141E26;color:#CBD5E1;">Deepfake Score</th><th style="background:#141E26;color:#CBD5E1;">Matched Ref</th><th style="background:#141E26;color:#CBD5E1;">Reasons</th><th style="background:#141E26;color:#CBD5E1;">Admin Decision</th></tr></thead>
+              <tbody id="flagged-enrollments-tbody"><tr><td colspan="6" class="small" style="color:#94A3B8;">No flagged enrollments pending review.</td></tr></tbody>
+            </table>
+          </div>
+          <div class="status-line" id="flagged-enrollments-status" style="background:rgba(255,255,255,0.04);color:#CBD5E1;">Enrollment review actions log ENROLLMENT_APPROVED or ENROLLMENT_REJECTED to the audit chain.</div>
         </div>
 
         <div class="card" style="margin-bottom:20px;">
@@ -1452,15 +1474,38 @@
 
         if (isEnrolled) {
           const secs = Number(data.enrollment.speech_seconds).toFixed(1);
-          badge.className = "pill ok";
-          badge.textContent = `VOICEPRINT SAVED (${secs}s)`;
-          savedSecs.className = "pill ok";
-          savedSecs.textContent = `${secs}s ENROLLED`;
-          setStatus(
-            "user-voice-saved-summary",
-            `Saved on account for ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...). Re-enrollment is never requested on login — submit a verification request below.`,
-            "ok"
-          );
+          const eStatus = data.enrollment.enrollment_status || "ACTIVE";
+          if (eStatus === "PENDING_REVIEW") {
+            badge.className = "pill warn";
+            badge.textContent = "VOICEPRINT UNDER REVIEW";
+            savedSecs.className = "pill warn";
+            savedSecs.textContent = `${secs}s · PENDING REVIEW`;
+            setStatus(
+              "user-voice-saved-summary",
+              data.enrollment.status_message || "Your voiceprint was saved and needs a quick manual review before high-risk actions are enabled.",
+              "warn"
+            );
+          } else if (eStatus === "REJECTED") {
+            badge.className = "pill bad";
+            badge.textContent = "VOICEPRINT REJECTED";
+            savedSecs.className = "pill bad";
+            savedSecs.textContent = "REJECTED";
+            setStatus(
+              "user-voice-saved-summary",
+              "Your voiceprint enrollment was rejected and cannot be used. Contact Admin SOC for assistance.",
+              "err"
+            );
+          } else {
+            badge.className = "pill ok";
+            badge.textContent = `VOICEPRINT SAVED (${secs}s)`;
+            savedSecs.className = "pill ok";
+            savedSecs.textContent = `${secs}s ENROLLED`;
+            setStatus(
+              "user-voice-saved-summary",
+              `Saved on account for ${data.enrollment.subject_ref} (SHA-256 ${data.enrollment.audio_sha256.slice(0, 12)}...). Re-enrollment is never requested on login — submit a verification request below.`,
+              "ok"
+            );
+          }
         } else {
           badge.className = "pill warn";
           badge.textContent = "NO VOICEPRINT ON ACCOUNT";
@@ -1572,9 +1617,10 @@
 
     async function refreshAdminPanels() {
       try {
-        const [health, enrollRes, auditRes, riskRes, metrics, reviewRes, chainRes, accRes] = await Promise.all([
+        const [health, enrollRes, flaggedRes, auditRes, riskRes, metrics, reviewRes, chainRes, accRes] = await Promise.all([
           apiJson("/api/v1/health"),
           apiJson("/api/v1/enrollments"),
+          apiJson("/api/v1/admin/enrollments?status=PENDING_REVIEW"),
           apiJson("/api/v1/audit"),
           apiJson("/api/v1/risk-events"),
           apiJson("/api/v1/metrics"),
@@ -1604,6 +1650,7 @@
         state.enrollments = enrollRes.enrollments || [];
         renderSubjectDropdown();
         renderEnrolledTable(state.enrollments);
+        renderFlaggedEnrollments(flaggedRes.enrollments || []);
         state.riskEvents = riskRes.risk_events || [];
         document.getElementById("stat-risks").textContent = String(state.riskEvents.filter(r => r.risk_state === "ACTIVE" && !r.expired).length);
         refreshRiskBanner();
@@ -1939,11 +1986,64 @@
     function renderEnrolledTable(rows) {
       const tbody = document.getElementById("enrolled-tbody");
       if (!tbody) return;
-      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="5" class="small">No enrolled subjects yet.</td></tr>`; return; }
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="8" class="small">No enrolled subjects yet.</td></tr>`; return; }
       tbody.innerHTML = rows.map(r => {
         const ts = r.created_at ? new Date(r.created_at).toISOString().replace("T", " ").slice(0, 19) : "--";
-        return `<tr><td><strong>${escapeHtml(r.subject_ref)}</strong></td><td>${escapeHtml(r.consent_ref)}</td><td>${Number(r.speech_seconds).toFixed(1)}s</td><td>${escapeHtml(String(r.audio_sha256 || "").slice(0, 14))}…</td><td>${escapeHtml(ts)}</td></tr>`;
+        const st = r.enrollment_status || "ACTIVE";
+        const stCls = st === "ACTIVE" ? "ok" : st === "REJECTED" ? "bad" : "warn";
+        const dfScore = r.enroll_deepfake_score != null ? `${Number(r.enroll_deepfake_score).toFixed(3)} / ${Number(r.enroll_deepfake_threshold ?? 0.62).toFixed(2)}` : "--";
+        const dupRef = r.duplicate_of_subject_ref ? `<span class="pill warn">${escapeHtml(r.duplicate_of_subject_ref)}</span>` : "—";
+        return `<tr><td><strong>${escapeHtml(r.subject_ref)}</strong></td><td><span class="pill ${stCls}">${escapeHtml(st)}</span></td><td>${escapeHtml(dfScore)}</td><td>${dupRef}</td><td>${escapeHtml(r.consent_ref)}</td><td>${Number(r.speech_seconds).toFixed(1)}s</td><td>${escapeHtml(String(r.audio_sha256 || "").slice(0, 14))}…</td><td>${escapeHtml(ts)}</td></tr>`;
       }).join("");
+    }
+
+    function renderFlaggedEnrollments(rows) {
+      const tbody = document.getElementById("flagged-enrollments-tbody");
+      if (!tbody) return;
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="6" class="small" style="color:#94A3B8;">No flagged enrollments pending review.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = rows.map(r => {
+        const sub = escapeHtml(r.subject_ref);
+        const dfScore = r.enroll_deepfake_score != null ? Number(r.enroll_deepfake_score).toFixed(3) : "--";
+        const dup = r.duplicate_of_subject_ref ? escapeHtml(r.duplicate_of_subject_ref) : "—";
+        const reasons = escapeHtml((r.reason_codes || []).join(", ") || "PENDING_REVIEW");
+        return `<tr>
+          <td><strong style="color:#F8FAFC;">${sub}</strong></td>
+          <td><span class="pill warn">${escapeHtml(r.enrollment_status)}</span></td>
+          <td>${escapeHtml(dfScore)}</td>
+          <td><code style="color:#FBC02D;">${dup}</code></td>
+          <td>${reasons}</td>
+          <td><div class="btn-row">
+            <button type="button" class="btn btn-primary btn-sm" onclick="submitEnrollmentReview('${sub}', 'APPROVED')">Approve</button>
+            <button type="button" class="btn btn-danger btn-sm" onclick="submitEnrollmentReview('${sub}', 'REJECTED')">Reject</button>
+          </div></td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function submitEnrollmentReview(subjectRef, decision) {
+      const reason = (document.getElementById("enroll-review-reason-input")?.value || "").trim();
+      if (reason.length < 3) {
+        setStatus("flagged-enrollments-status", "Enter a review reason (min 3 characters) before approving or rejecting an enrollment.", "err");
+        return;
+      }
+      try {
+        const res = await apiJson(`/api/v1/admin/enrollments/${encodeURIComponent(subjectRef)}/review`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, reason })
+        });
+        setStatus(
+          "flagged-enrollments-status",
+          `${subjectRef} -> ${res.enrollment.enrollment_status} (${res.audit_code}) by ${res.reviewed_by} at ${res.reviewed_at}`,
+          decision === "APPROVED" ? "ok" : "err"
+        );
+        await refreshAdminPanels();
+      } catch (err) {
+        setStatus("flagged-enrollments-status", err.message, "err");
+      }
     }
 
     function renderAuditTable(rows) {

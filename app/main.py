@@ -16,6 +16,7 @@ import struct
 import uuid
 import wave
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -59,7 +60,12 @@ from app.db import (
     init_db,
     is_storage_durable,
 )
-from app.detectif_client import DetectifClient, DetectifProviderError, ProviderVerifyResult
+from app.detectif_client import (
+    DetectifClient,
+    DetectifProviderError,
+    ProviderDeepfakeResult,
+    ProviderVerifyResult,
+)
 from app.models import (
     AuditEvent,
     Decision,
@@ -390,6 +396,11 @@ class ResolveAlertRequest(BaseModel):
     resolution_note: str = Field("Resolved by SOC administrator", min_length=2, max_length=256)
 
 
+class ReviewEnrollmentRequest(BaseModel):
+    decision: Literal["APPROVED", "REJECTED"]
+    reason: str = Field(..., min_length=3, max_length=256)
+
+
 def _actor_dict(actor: AuthActor) -> dict[str, Any]:
     return {
         "username": actor.username,
@@ -445,8 +456,32 @@ def auth_me(actor: AuthActor | None = Depends(get_optional_actor)) -> dict[str, 
     return {"authenticated": True, "user": _actor_dict(actor)}
 
 
-def _enrollment_payload(record: Enrollment, duration_seconds: float | None = None) -> dict[str, Any]:
-    """Serialize an Enrollment row into the API response shape."""
+PENDING_ENROLLMENT_USER_MESSAGE = (
+    "Your voiceprint was saved and needs a quick manual review before high-risk actions are enabled."
+)
+
+
+@dataclass(frozen=True)
+class _ProtectedEnrollBundle:
+    wav_bytes: bytes
+    provider_res: Any
+    audio_digest: str
+    perceptual_digest: str | None
+    deepfake_res: ProviderDeepfakeResult
+    enrollment_status: str
+    duplicate_of_subject_ref: str | None
+    reason_codes: list[str]
+
+
+def _enrollment_payload(
+    record: Enrollment,
+    duration_seconds: float | None = None,
+    *,
+    include_admin_fields: bool = False,
+) -> dict[str, Any]:
+    """Serialize an Enrollment row into API shape without leaking duplicate metadata to end users."""
+    status = record.enrollment_status or "ACTIVE"
+    raw_reasons = json.loads(record.enrollment_reason_codes_json or "[]")
     payload: dict[str, Any] = {
         "id": record.id,
         "subject_ref": record.subject_ref,
@@ -455,12 +490,181 @@ def _enrollment_payload(record: Enrollment, duration_seconds: float | None = Non
         "consent_text": record.consent_text,
         "audio_sha256": record.audio_sha256,
         "speech_seconds": record.speech_seconds,
+        "enrollment_status": status,
         "created_at": _as_utc(record.created_at).isoformat(),
         "re_enrolled_at": _as_utc(record.re_enrolled_at).isoformat() if record.re_enrolled_at else None,
     }
+    if status == "PENDING_REVIEW":
+        payload["status_message"] = PENDING_ENROLLMENT_USER_MESSAGE
+    elif status == "REJECTED":
+        payload["status_message"] = "This voiceprint enrollment was rejected and cannot be used."
+    if include_admin_fields:
+        payload["privileged_role"] = bool(record.privileged_role)
+        payload["duplicate_of_subject_ref"] = record.duplicate_of_subject_ref
+        payload["reason_codes"] = raw_reasons
+        payload["enroll_deepfake_score"] = record.enroll_deepfake_score
+        payload["enroll_deepfake_threshold"] = record.enroll_deepfake_threshold
+        payload["enroll_deepfake_segments"] = json.loads(record.enroll_deepfake_segments_json or "[]")
+        payload["enroll_deepfake_request_id"] = record.enroll_deepfake_request_id
+        payload["reviewed_by"] = record.reviewed_by
+        payload["review_reason"] = record.review_reason
+        payload["reviewed_at"] = _as_utc(record.reviewed_at).isoformat() if record.reviewed_at else None
     if duration_seconds is not None:
         payload["duration_seconds"] = duration_seconds
     return payload
+
+
+async def _run_enrollment_protection_and_enroll(
+    *,
+    subject_ref: str,
+    wav_bytes: bytes,
+    db: Session,
+    client: DetectifClient,
+) -> _ProtectedEnrollBundle:
+    """Run Aletheia deepfake gate and parallel duplicate-voice check BEFORE calling Eidos enroll."""
+    # 1) Feature 1: Enrollment Deepfake Gate via Aletheia (POST /v1/deepfake/detect)
+    try:
+        df_res = client.detect_deepfake(wav_bytes=wav_bytes)
+    except DetectifProviderError as exc:
+        _append_audit_event(
+            db,
+            session_id=f"enroll-{subject_ref}",
+            sector="enrollment",
+            action="enroll",
+            outcome="REVIEW / HOLD",
+            reason_codes=["PROVIDER_UNAVAILABLE", exc.error_code],
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "PROVIDER_UNAVAILABLE",
+                "reason_codes": ["PROVIDER_UNAVAILABLE"],
+                "message": "Voice liveness check is temporarily unavailable. Please try again in a few moments.",
+            },
+        ) from exc
+
+    if df_res.verdict not in {"real", "fake"}:
+        _append_audit_event(
+            db,
+            session_id=f"enroll-{subject_ref}",
+            sector="enrollment",
+            action="enroll",
+            outcome="REVIEW / HOLD",
+            reason_codes=["PROVIDER_UNAVAILABLE", "UNPARSEABLE_DEEPFAKE_VERDICT"],
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "PROVIDER_UNAVAILABLE",
+                "reason_codes": ["PROVIDER_UNAVAILABLE"],
+                "message": "Voice liveness check returned an unexpected response. Please try again.",
+            },
+        )
+
+    if df_res.verdict == "fake":
+        _append_audit_event(
+            db,
+            session_id=f"enroll-{subject_ref}",
+            sector="enrollment",
+            action="enroll",
+            outcome="REJECTED",
+            reason_codes=["ENROLLMENT_SYNTHETIC_INDICATOR"],
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "ENROLLMENT_SYNTHETIC_INDICATOR",
+                "outcome": "REJECTED",
+                "reason_codes": ["ENROLLMENT_SYNTHETIC_INDICATOR"],
+                "message": (
+                    "This recording could not be accepted as a live voice sample. "
+                    "Please record again in a quiet place, speaking naturally."
+                ),
+            },
+        )
+
+    # 2) Feature 2: Duplicate-voice check BEFORE calling enroll_speaker
+    audio_digest = hashlib.sha256(wav_bytes).hexdigest()
+    perceptual_digest = compute_perceptual_hash(wav_bytes)
+    active_others = list(
+        db.scalars(
+            select(Enrollment).where(
+                Enrollment.subject_ref != subject_ref,
+                Enrollment.enrollment_status == "ACTIVE",
+            )
+        ).all()
+    )
+
+    enrollment_status = "ACTIVE"
+    duplicate_of_subject_ref: str | None = None
+    enroll_reasons: list[str] = []
+
+    exact_match = next((row for row in active_others if row.audio_sha256 == audio_digest), None)
+    if exact_match is not None:
+        enrollment_status = "PENDING_REVIEW"
+        duplicate_of_subject_ref = exact_match.subject_ref
+        enroll_reasons = ["DUPLICATE_VOICE_DETECTED"]
+    elif active_others:
+        max_conc = 8
+        per_call_timeout = float(os.getenv("ENROLL_DUP_CALL_TIMEOUT_SECONDS", "10.0"))
+        total_budget = float(os.getenv("ENROLL_DUP_CHECK_BUDGET_SECONDS", "20.0"))
+        sem = asyncio.Semaphore(max_conc)
+
+        async def _verify_against(other: Enrollment) -> tuple[str, str]:
+            async with sem:
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(client.verify_with_deepfake, other.provider_speaker_id, wav_bytes),
+                    timeout=per_call_timeout,
+                )
+                return other.subject_ref, res.speaker_decision
+
+        tasks = [asyncio.create_task(_verify_against(other)) for other in active_others]
+        incomplete = False
+        try:
+            done_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=total_budget)
+            for item in done_results:
+                if isinstance(item, Exception):
+                    incomplete = True
+                else:
+                    matched_sub, decision = item
+                    if decision == "match":
+                        duplicate_of_subject_ref = matched_sub
+                        enrollment_status = "PENDING_REVIEW"
+                        enroll_reasons = ["DUPLICATE_VOICE_DETECTED"]
+                        break
+        except asyncio.TimeoutError:
+            incomplete = True
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if duplicate_of_subject_ref is None and incomplete:
+            enrollment_status = "PENDING_REVIEW"
+            enroll_reasons = ["DUPLICATE_CHECK_INCOMPLETE"]
+
+    # 3) Enroll speaker in DetectifAI Eidos
+    try:
+        provider_res = client.enroll_speaker(speaker_id=subject_ref, wav_bytes=wav_bytes)
+    except DetectifProviderError as exc:
+        status = exc.status_code if exc.status_code in {400, 401, 403, 422, 429} else 502
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": exc.error_code, "message": exc.message, "request_id": exc.request_id},
+        ) from exc
+
+    return _ProtectedEnrollBundle(
+        wav_bytes=wav_bytes,
+        provider_res=provider_res,
+        audio_digest=audio_digest,
+        perceptual_digest=perceptual_digest,
+        deepfake_res=df_res,
+        enrollment_status=enrollment_status,
+        duplicate_of_subject_ref=duplicate_of_subject_ref,
+        reason_codes=enroll_reasons,
+    )
 
 
 async def _validate_and_enroll_wav(
@@ -469,8 +673,9 @@ async def _validate_and_enroll_wav(
     consent_confirmed: bool,
     file: UploadFile,
     client: DetectifClient,
-) -> tuple[bytes, Any]:
-    """Validate speaker consent + 15-60s 16kHz PCM WAV and enroll via Eidos."""
+    db: Session,
+) -> _ProtectedEnrollBundle:
+    """Validate consent + 15-60s 16kHz PCM WAV, run deepfake & duplicate gates, then enroll."""
     if not consent_confirmed:
         raise HTTPException(status_code=400, detail="Explicit speaker consent (consent_confirmed=true) is required.")
 
@@ -487,15 +692,12 @@ async def _validate_and_enroll_wav(
             detail=f"Enrollment audio duration must be between 15 and 60 seconds (got {duration_s}s).",
         )
 
-    try:
-        provider_res = client.enroll_speaker(speaker_id=subject_ref, wav_bytes=wav_bytes)
-    except DetectifProviderError as exc:
-        status = exc.status_code if exc.status_code in {400, 401, 403, 422, 429} else 502
-        raise HTTPException(
-            status_code=status,
-            detail={"error_code": exc.error_code, "message": exc.message, "request_id": exc.request_id},
-        ) from exc
-    return wav_bytes, provider_res
+    return await _run_enrollment_protection_and_enroll(
+        subject_ref=subject_ref,
+        wav_bytes=wav_bytes,
+        db=db,
+        client=client,
+    )
 
 
 @app.post("/api/v1/auth/register")
@@ -570,15 +772,15 @@ async def auth_register_with_voice(
     while db.scalar(select(UserAccount).where(UserAccount.subject_ref == subject_ref)) is not None:
         subject_ref = _make_subject_ref(clean_username)
 
-    wav_bytes, provider_res = await _validate_and_enroll_wav(
+    bundle = await _validate_and_enroll_wav(
         subject_ref=subject_ref,
         consent_confirmed=consent_confirmed,
         file=file,
         client=client,
+        db=db,
     )
-
-    audio_digest = hashlib.sha256(wav_bytes).hexdigest()
-    perceptual_digest = compute_perceptual_hash(wav_bytes)
+    provider_res = bundle.provider_res
+    df_res = bundle.deepfake_res
     account = UserAccount(
         username=clean_username,
         display_name=clean_display,
@@ -590,8 +792,15 @@ async def auth_register_with_voice(
         provider_speaker_id=provider_res.speaker_id,
         consent_ref=consent_ref,
         consent_text=clean_consent_text,
-        audio_sha256=audio_digest,
+        audio_sha256=bundle.audio_digest,
         speech_seconds=provider_res.speech_seconds,
+        enrollment_status=bundle.enrollment_status,
+        duplicate_of_subject_ref=bundle.duplicate_of_subject_ref,
+        enrollment_reason_codes_json=json.dumps(bundle.reason_codes),
+        enroll_deepfake_score=df_res.score,
+        enroll_deepfake_threshold=df_res.threshold,
+        enroll_deepfake_segments_json=json.dumps(df_res.segments),
+        enroll_deepfake_request_id=df_res.request_id,
     )
     db.add(account)
     db.add(record)
@@ -599,11 +808,20 @@ async def auth_register_with_voice(
         VerificationTelemetry(
             session_id=None,
             event_kind="enroll",
-            audio_sha256=audio_digest,
-            perceptual_hash=perceptual_digest,
+            audio_sha256=bundle.audio_digest,
+            perceptual_hash=bundle.perceptual_digest,
             credits_balance=provider_res.credits_balance,
         )
     )
+    if bundle.enrollment_status == "PENDING_REVIEW":
+        _append_audit_event(
+            db,
+            session_id=f"enroll-{subject_ref}",
+            sector="enrollment",
+            action="enroll",
+            outcome="REVIEW / HOLD",
+            reason_codes=bundle.reason_codes or ["ENROLLMENT_UNDER_REVIEW"],
+        )
     db.commit()
     db.refresh(account)
     db.refresh(record)
@@ -618,7 +836,7 @@ async def auth_register_with_voice(
     return {
         "authenticated": True,
         "user": _actor_dict(actor),
-        "enrollment": _enrollment_payload(record, provider_res.duration_seconds),
+        "enrollment": _enrollment_payload(record, provider_res.duration_seconds, include_admin_fields=False),
     }
 
 
@@ -710,13 +928,7 @@ def user_overview(
 
     return {
         "enrollment": (
-            {
-                "subject_ref": enrollment.subject_ref,
-                "consent_ref": enrollment.consent_ref,
-                "audio_sha256": enrollment.audio_sha256,
-                "speech_seconds": enrollment.speech_seconds,
-                "created_at": _as_utc(enrollment.created_at).isoformat(),
-            }
+            _enrollment_payload(enrollment, include_admin_fields=False)
             if enrollment
             else None
         ),
@@ -735,25 +947,87 @@ def list_enrollments(
     db: Session = Depends(get_db),
     actor: AuthActor = Depends(get_current_actor),
 ) -> dict[str, Any]:
-    """List pseudonymous speaker enrollments (scoped to own subject_ref for standard users)."""
+    """List pseudonymous speaker enrollments (duplicate metadata restricted to admin callers)."""
     stmt = select(Enrollment).order_by(Enrollment.created_at.desc())
     if actor.role != "admin":
         stmt = stmt.where(Enrollment.subject_ref == actor.subject_ref)
     rows = db.scalars(stmt).all()
+    is_admin = actor.role == "admin"
     return {
-        "enrollments": [
-            {
-                "id": r.id,
-                "subject_ref": r.subject_ref,
-                "provider_speaker_id": r.provider_speaker_id,
-                "consent_ref": r.consent_ref,
-                "audio_sha256": r.audio_sha256,
-                "speech_seconds": r.speech_seconds,
-                "privileged_role": bool(r.privileged_role),
-                "created_at": _as_utc(r.created_at).isoformat(),
-            }
-            for r in rows
-        ]
+        "enrollments": [_enrollment_payload(r, include_admin_fields=is_admin) for r in rows]
+    }
+
+
+@app.get("/api/v1/admin/enrollments")
+def admin_list_enrollments(
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    _admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """List speaker enrollments with optional status filter (ACTIVE, PENDING_REVIEW, REJECTED) for SOC review."""
+    stmt = select(Enrollment).order_by(Enrollment.created_at.desc())
+    if status is not None and status.strip():
+        clean_status = status.strip().upper()
+        if clean_status not in {"ACTIVE", "PENDING_REVIEW", "REJECTED"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status filter. Valid values: ACTIVE, PENDING_REVIEW, REJECTED.",
+            )
+        stmt = stmt.where(Enrollment.enrollment_status == clean_status)
+    rows = db.scalars(stmt).all()
+    return {
+        "enrollments": [_enrollment_payload(r, include_admin_fields=True) for r in rows]
+    }
+
+
+@app.post("/api/v1/admin/enrollments/{subject_ref}/review")
+def admin_review_enrollment(
+    subject_ref: str,
+    body: ReviewEnrollmentRequest,
+    db: Session = Depends(get_db),
+    admin: AuthActor = Depends(require_admin),
+) -> dict[str, Any]:
+    """Approve or reject a PENDING_REVIEW (or existing) enrollment with required reason and audit trail."""
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == subject_ref))
+    if enrollment is None:
+        raise HTTPException(status_code=404, detail=f"Enrollment for '{subject_ref}' not found.")
+
+    clean_reason = body.reason.strip()
+    if len(clean_reason) < 3:
+        raise HTTPException(status_code=400, detail="A non-empty review reason (min 3 chars) is required.")
+
+    now = utcnow()
+    if body.decision == "APPROVED":
+        enrollment.enrollment_status = "ACTIVE"
+        audit_code = "ENROLLMENT_APPROVED"
+    else:
+        enrollment.enrollment_status = "REJECTED"
+        audit_code = "ENROLLMENT_REJECTED"
+
+    enrollment.reviewed_by = admin.username
+    enrollment.review_reason = clean_reason
+    enrollment.reviewed_at = now
+    existing_reasons = json.loads(enrollment.enrollment_reason_codes_json or "[]")
+    enrollment.enrollment_reason_codes_json = json.dumps([*existing_reasons, audit_code])
+
+    _append_audit_event(
+        db,
+        session_id=f"enroll-{subject_ref}",
+        sector="enrollment",
+        action="enrollment_review",
+        outcome=body.decision,
+        reason_codes=[audit_code, f"REASON:{clean_reason[:80]}"],
+        created_at=now,
+    )
+    db.commit()
+    db.refresh(enrollment)
+    return {
+        "enrollment": _enrollment_payload(enrollment, include_admin_fields=True),
+        "decision": body.decision,
+        "audit_code": audit_code,
+        "reviewed_by": admin.username,
+        "review_reason": clean_reason,
+        "reviewed_at": now.isoformat(),
     }
 
 
@@ -966,6 +1240,8 @@ def trigger_offline_swap_callback(
     enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == body.subject_ref))
     if enrollment is None:
         raise HTTPException(status_code=404, detail=f"Subject '{body.subject_ref}' is not enrolled.")
+    if enrollment.enrollment_status == "REJECTED":
+        raise HTTPException(status_code=403, detail="Speaker enrollment has been rejected and cannot be used.")
 
     now = utcnow()
     session_id = str(uuid.uuid4())
@@ -1066,22 +1342,33 @@ async def create_enrollment(
                 detail="Voiceprint is already enrolled for this account; re-enrollment requires an APPROVED verified session or admin approval.",
             )
 
-    wav_bytes, provider_res = await _validate_and_enroll_wav(
+    bundle = await _validate_and_enroll_wav(
         subject_ref=subject_ref,
         consent_confirmed=consent_confirmed,
         file=file,
         client=client,
+        db=db,
     )
+    provider_res = bundle.provider_res
+    df_res = bundle.deepfake_res
 
     now = utcnow()
-    audio_digest = hashlib.sha256(wav_bytes).hexdigest()
-    perceptual_digest = compute_perceptual_hash(wav_bytes)
     if existing is not None:
         existing.provider_speaker_id = provider_res.speaker_id
         existing.consent_ref = consent_ref
         existing.consent_text = clean_consent_text
-        existing.audio_sha256 = audio_digest
+        existing.audio_sha256 = bundle.audio_digest
         existing.speech_seconds = provider_res.speech_seconds
+        existing.enrollment_status = bundle.enrollment_status
+        existing.duplicate_of_subject_ref = bundle.duplicate_of_subject_ref
+        existing.enrollment_reason_codes_json = json.dumps(bundle.reason_codes)
+        existing.enroll_deepfake_score = df_res.score
+        existing.enroll_deepfake_threshold = df_res.threshold
+        existing.enroll_deepfake_segments_json = json.dumps(df_res.segments)
+        existing.enroll_deepfake_request_id = df_res.request_id
+        existing.reviewed_by = None
+        existing.review_reason = None
+        existing.reviewed_at = None
         existing.re_enrolled_at = now
         record = existing
     else:
@@ -1090,8 +1377,15 @@ async def create_enrollment(
             provider_speaker_id=provider_res.speaker_id,
             consent_ref=consent_ref,
             consent_text=clean_consent_text,
-            audio_sha256=audio_digest,
+            audio_sha256=bundle.audio_digest,
             speech_seconds=provider_res.speech_seconds,
+            enrollment_status=bundle.enrollment_status,
+            duplicate_of_subject_ref=bundle.duplicate_of_subject_ref,
+            enrollment_reason_codes_json=json.dumps(bundle.reason_codes),
+            enroll_deepfake_score=df_res.score,
+            enroll_deepfake_threshold=df_res.threshold,
+            enroll_deepfake_segments_json=json.dumps(df_res.segments),
+            enroll_deepfake_request_id=df_res.request_id,
         )
         db.add(record)
 
@@ -1099,16 +1393,30 @@ async def create_enrollment(
         VerificationTelemetry(
             session_id=None,
             event_kind="enroll",
-            audio_sha256=audio_digest,
-            perceptual_hash=perceptual_digest,
+            audio_sha256=bundle.audio_digest,
+            perceptual_hash=bundle.perceptual_digest,
             credits_balance=provider_res.credits_balance,
         )
     )
+    if bundle.enrollment_status == "PENDING_REVIEW":
+        _append_audit_event(
+            db,
+            session_id=f"enroll-{subject_ref}",
+            sector="enrollment",
+            action="enroll",
+            outcome="REVIEW / HOLD",
+            reason_codes=bundle.reason_codes or ["ENROLLMENT_UNDER_REVIEW"],
+            created_at=now,
+        )
     db.commit()
     db.refresh(record)
 
     return {
-        "enrollment": _enrollment_payload(record, provider_res.duration_seconds),
+        "enrollment": _enrollment_payload(
+            record,
+            provider_res.duration_seconds,
+            include_admin_fields=(actor.role == "admin"),
+        ),
         "provider": {
             "request_id": provider_res.request_id,
             "operation_id": provider_res.operation_id,
@@ -1135,6 +1443,10 @@ def create_verification_session(
     enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == body.subject_ref))
     if enrollment is None:
         raise HTTPException(status_code=404, detail=f"Subject '{body.subject_ref}' is not enrolled.")
+    if enrollment.enrollment_status == "REJECTED":
+        raise HTTPException(status_code=403, detail="Speaker enrollment has been rejected and cannot be used.")
+    if enrollment.enrollment_status == "REJECTED":
+        raise HTTPException(status_code=403, detail="Speaker enrollment has been rejected and cannot be used.")
 
     try:
         gateway_rate_limiter.check_sliding_limit(
@@ -1256,6 +1568,11 @@ async def submit_verification_audio(
     action_meta = validate_sector_action(session.sector, session.action)
     is_critical = bool(action_meta.get("critical", False))
     demo_mode = is_demo_mode()
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
+    enrollment_rejected = bool(enrollment is not None and enrollment.enrollment_status == "REJECTED")
+    enrollment_under_review_hold = bool(
+        enrollment is not None and enrollment.enrollment_status == "PENDING_REVIEW" and is_critical
+    )
 
     active_risks = db.scalars(
         select(RiskEvent).where(
@@ -1268,7 +1585,7 @@ async def submit_verification_audio(
     is_expired = now > _as_utc(session.expires_at)
 
     replay_match_type: str | None = None
-    if not is_expired and (audio_digest or perceptual_digest):
+    if not is_expired and not enrollment_rejected and not enrollment_under_review_hold and (audio_digest or perceptual_digest):
         prior_verifies = db.scalars(
             select(VerificationTelemetry).where(
                 VerificationTelemetry.event_kind == "verify",
@@ -1288,13 +1605,20 @@ async def submit_verification_audio(
                 break
 
     quality_report: AudioQualityReport | None = None
-    if replay_match_type is None and not is_expired and wav_bytes and (wav_duration is None or wav_duration >= 4.0):
+    if (
+        replay_match_type is None
+        and not is_expired
+        and not enrollment_rejected
+        and not enrollment_under_review_hold
+        and wav_bytes
+        and (wav_duration is None or wav_duration >= 4.0)
+    ):
         quality_report = inspect_pcm_wav_quality(wav_bytes)
     quality_failed = bool(quality_report is not None and quality_report.valid_wav and not quality_report.passed)
 
     asr_available = True
     effective_transcript = ""
-    if not is_expired and replay_match_type is None and not quality_failed:
+    if not is_expired and not enrollment_rejected and not enrollment_under_review_hold and replay_match_type is None and not quality_failed:
         if demo_mode and spoken_transcript.strip():
             effective_transcript = spoken_transcript
             asr_available = True
@@ -1309,6 +1633,8 @@ async def submit_verification_audio(
     phrase_blocked_before_provider = require_phrase and asr_available and not phrase_match
     should_call_provider = (
         not is_expired
+        and not enrollment_rejected
+        and not enrollment_under_review_hold
         and replay_match_type is None
         and not quality_failed
         and not phrase_blocked_before_provider
@@ -1317,7 +1643,6 @@ async def submit_verification_audio(
     provider_res: ProviderVerifyResult | None = None
     provider_error: str | None = None
     segment_disagreement = False
-    enrollment = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
 
     if should_call_provider:
         if enrollment is None:
@@ -1382,7 +1707,26 @@ async def submit_verification_audio(
         and (_as_utc(enrollment.re_enrolled_at) + timedelta(hours=cooldown_hours)) > now
     )
 
-    if replay_match_type is not None:
+    if enrollment_rejected and not is_expired:
+        evaluation = AuthorizationDecision(
+            outcome="REJECTED",
+            evidence_state="ENROLLMENT_REJECTED",
+            reason_codes=["ENROLLMENT_REJECTED"],
+            next_step_script="Speaker enrollment has been rejected and cannot authorize requests.",
+            emit_risk_alert=False,
+        )
+    elif enrollment_under_review_hold and not is_expired:
+        evaluation = AuthorizationDecision(
+            outcome="REVIEW / HOLD",
+            evidence_state="INCONCLUSIVE_EVIDENCE",
+            reason_codes=["ENROLLMENT_UNDER_REVIEW"],
+            next_step_script=(
+                f"{PENDING_ENROLLMENT_USER_MESSAGE} Complete a Non-Voice Accessibility Fallback: "
+                "Trusted App Push, In-Store Biometric KYC, or Verified Manager Callback."
+            ),
+            emit_risk_alert=False,
+        )
+    elif replay_match_type is not None:
         evaluation = AuthorizationDecision(
             outcome="REJECTED",
             evidence_state="REPLAY_DETECTED",
@@ -1715,6 +2059,9 @@ def complete_step_up(
         raise HTTPException(status_code=404, detail="Verification session or decision not found.")
     if actor.role != "admin" and session.subject_ref != actor.subject_ref:
         raise HTTPException(status_code=403, detail="Cannot complete step-up for another user's session.")
+    enroll_rec = db.scalar(select(Enrollment).where(Enrollment.subject_ref == session.subject_ref))
+    if enroll_rec is not None and enroll_rec.enrollment_status == "REJECTED":
+        raise HTTPException(status_code=403, detail="Speaker enrollment has been rejected and cannot be used.")
     if body.amount_inr is not None and actor.role != "admin":
         raise HTTPException(status_code=403, detail="Only admin/backend callers may supply banking amount_inr.")
 
