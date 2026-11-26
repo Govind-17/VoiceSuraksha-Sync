@@ -80,20 +80,23 @@
     .nav-links a:hover, .nav-links button:hover {
       color: #28CB8B; background: rgba(40, 203, 139, 0.1); border-color: rgba(40, 203, 139, 0.28);
     }
-    .nav-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
-    .navbar .pill {
+    .nav-actions { display: flex; align-items: center; gap: 7px; flex-wrap: nowrap; justify-content: flex-end; }
+    .navbar .pill, .soc-ribbon .pill {
       background: rgba(255, 255, 255, 0.06); border-color: rgba(148, 163, 184, 0.28);
-      color: #E2E8F0; padding: 4px 10px; font-size: 10.5px;
+      color: #E2E8F0; padding: 4px 10px; font-size: 10.5px; white-space: nowrap; flex-shrink: 0;
     }
-    .navbar .pill.ok { background: rgba(40, 203, 139, 0.14); border-color: rgba(40, 203, 139, 0.45); color: #34D399; }
-    .navbar .pill.info { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.42); color: #7DD3FC; }
-    .navbar .pill.warn { background: rgba(251, 192, 45, 0.14); border-color: rgba(251, 192, 45, 0.45); color: #FCD34D; }
-    .navbar .pill.bad { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.48); color: #FCA5A5; }
-    .navbar .btn-nav-ghost {
-      background: rgba(255, 255, 255, 0.06); color: #E2E8F0; border: 1px solid rgba(148, 163, 184, 0.32);
-      padding: 6px 11px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    .navbar .pill.ok, .soc-ribbon .pill.ok { background: rgba(40, 203, 139, 0.14); border-color: rgba(40, 203, 139, 0.45); color: #34D399; }
+    .navbar .pill.info, .soc-ribbon .pill.info { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.42); color: #7DD3FC; }
+    .navbar .pill.warn, .soc-ribbon .pill.warn { background: rgba(251, 192, 45, 0.14); border-color: rgba(251, 192, 45, 0.45); color: #FCD34D; }
+    .navbar .pill.bad, .soc-ribbon .pill.bad { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.48); color: #FCA5A5; }
+    .navbar .btn-nav-ghost, .soc-ribbon .btn-nav-ghost {
+      background: rgba(255, 255, 255, 0.06); color: #E2E8F0; border: 1px solid rgba(40, 203, 139, 0.35);
+      padding: 5px 11px; border-radius: 6px; font-size: 11.5px; font-family: var(--mono); font-weight: 500;
+      cursor: pointer; white-space: nowrap; flex-shrink: 0;
     }
-    .navbar .btn-nav-ghost:hover:not(:disabled) { border-color: #28CB8B; color: #28CB8B; background: rgba(40, 203, 139, 0.1); }
+    .navbar .btn-nav-ghost:hover:not(:disabled), .soc-ribbon .btn-nav-ghost:hover:not(:disabled) {
+      border-color: #28CB8B; color: #28CB8B; background: rgba(40, 203, 139, 0.12);
+    }
     .navbar .btn-nav-logout {
       background: rgba(40, 203, 139, 0.14); color: #34D399; border: 1px solid rgba(40, 203, 139, 0.48);
       padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
@@ -117,7 +120,7 @@
     @media (max-width: 1120px) {
       .nav-links { display: none !important; }
       .nav-menu-btn { display: inline-flex; align-items: center; }
-      #storage-pill, #sim-pill { display: none !important; }
+      .navbar #storage-pill, .navbar #sim-pill { display: none !important; }
     }
 
     .pill {
@@ -366,13 +369,19 @@
       padding: 12px 0;
       color: #E2E8F0;
     }
+    .soc-ribbon .container, .navbar .container { max-width: 1440px; }
     .soc-ribbon-inner {
-      display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+      display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
     }
-    .soc-metrics-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .soc-metrics-group {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-start;
+    }
+    .soc-queue-right {
+      display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; margin-left: auto;
+    }
     .soc-metric-tile {
-      display: flex; align-items: center; gap: 10px;
-      padding: 7px 13px; border-radius: 8px;
+      display: flex; align-items: center; gap: 10px; white-space: nowrap;
+      padding: 7px 12px; border-radius: 8px;
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(40, 203, 139, 0.22);
     }
@@ -472,7 +481,7 @@
         <a href="#audit">Audit</a>
       </nav>
 
-      <div class="nav-actions">
+      <div class="nav-actions" id="nav-right-slot">
         <span class="pill ok" id="health-pill"><span class="dot"></span><span id="health-text">CHECKING...</span></span>
         <span class="pill info hidden" id="role-pill"></span>
         <span class="pill hidden" id="storage-pill">DB: --</span>
@@ -721,14 +730,13 @@
             </div>
           </div>
         </div>
-        <div class="btn-row">
+        <div class="soc-queue-right" id="soc-queue-right">
           <span class="pill" style="background:rgba(40,203,139,0.14);border-color:rgba(40,203,139,0.4);color:#28CB8B;">ACTIVE ALERTS: <strong id="metric-active-alerts">0</strong></span>
-          <button class="btn-obsidian-ghost" id="btn-ribbon-clear-alerts" onclick="clearDemoAlerts()">Clear Demo Alerts</button>
         </div>
       </div>
     </div>
 
-    <section class="hero" id="top">
+    <section class="hero" id="admin-hero">
       <div class="container">
         <div class="hero-grid">
           <div>
@@ -1369,6 +1377,22 @@
       const mobileDrawer = document.getElementById("mobile-nav-drawer");
       if (mobileDrawer) mobileDrawer.classList.add("hidden");
 
+      const navSlot = document.getElementById("nav-right-slot");
+      const queueSlot = document.getElementById("soc-queue-right");
+      const queueIds = ["health-pill", "role-pill", "storage-pill", "enrolled-pill", "sim-pill", "btn-clear-alerts"];
+      if (isAdmin && queueSlot) {
+        const alertAnchor = queueSlot.firstElementChild;
+        for (const id of queueIds) {
+          const node = document.getElementById(id);
+          if (node) queueSlot.insertBefore(node, alertAnchor || null);
+        }
+      } else if (navSlot) {
+        const logoutBtn = document.getElementById("btn-logout");
+        for (const id of queueIds) {
+          const node = document.getElementById(id);
+          if (node) navSlot.insertBefore(node, logoutBtn || null);
+        }
+      }
       if (!isAuth) return;
 
       document.getElementById("role-pill").textContent = isAdmin
